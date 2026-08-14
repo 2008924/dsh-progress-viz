@@ -39,11 +39,18 @@ dsh 会把每次任务的完整事件流实时追加写入本地会话文件：
 ## 安装与快速开始
 
 ```bash
-pip install zstandard>=0.21
-
-# 启动看板服务器（默认端口 8123，也可指定其他端口）
+# 方式一：只装依赖，直接运行脚本（无需安装本项目）
+pip install "zstandard>=0.21"
 python dashboard.py 8123
+
+# 方式二：按项目安装（pyproject.toml，自动带上 zstandard 依赖）
+pip install .
+python dashboard.py 8123        # 或 python -m dashboard 8123
 ```
+
+> 本项目是**纯脚本型**包（无 console script 入口、不提供 `import` 模块），
+> `pip install .` 只是安装依赖并注册元信息；运行方式与直接运行脚本完全一致：
+> 在项目目录执行 `python dashboard.py [port]`（或 `python -m dashboard [port]`）。
 
 启动行为：
 
@@ -101,19 +108,27 @@ python tests/test_eta_blend.py         # ETA 融合算法单测（历史会话 f
 python tests/test_multi_pane.py        # 多任务分栏单测（1 小时窗口 / mtime 排序 / status 判定）
 python tests/test_tail_format.py       # tail 可读性单测（chunk 合并 / 时间戳 / 动作高亮 / 截断）
 python tests/test_port.py              # 端口冲突自动递增单测（socket 占用模拟，随机高位端口）
+python tests/test_cache.py             # 解析缓存单测（mtime 未变不重新解压 / 修改后重解析 / 缓存清理）
 ```
 
 GitHub Actions CI（`.github/workflows/ci.yml`）在 push 到 main 与 pull_request 时，
 以 ubuntu / macos / windows × Python 3.9 / 3.11 六种组合逐套运行上述单测。
+
+## 常见问题
+
+遇到「zstandard 未安装」「看不到任务」「端口被占用」「路径显示异常」「显示步骤N
+而不是任务名」「任务完成后卡片还在」「如何卸载/停止看板」等问题，请查阅
+**[docs/FAQ.md](docs/FAQ.md)**（7 问 7 答）。
 
 ## 文件结构
 
 ```
 dsh-progress-viz/
 ├── .github/workflows/ci.yml # GitHub Actions CI（3 平台 × 2 Python 矩阵）
-├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 轮询 + 多任务分栏 + ETA）
+├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 轮询 + 解析缓存 + 多任务分栏 + ETA）
 ├── session_progress.py   # 会话事件流 → 阶段解析器（纯本地）
 ├── index.html            # 看板页面（深色主题，多任务网格分栏，5s 自动刷新）
+├── pyproject.toml        # 项目元信息 / 依赖声明（pip install . 用）
 ├── tests/
 │   ├── make_fixtures.py              # 合成 fixtures 生成器（含历史会话 fixture）
 │   ├── test_session_progress.py      # 单测（无需 pytest）
@@ -121,7 +136,11 @@ dsh-progress-viz/
 │   ├── test_multi_pane.py            # 多任务分栏单测
 │   ├── test_tail_format.py           # tail 可读性单测
 │   ├── test_port.py                  # 端口冲突自动递增单测
+│   ├── test_cache.py                 # 解析缓存单测
 │   └── fixtures/session-synthetic.jsonl.zstd
+├── docs/
+│   ├── FAQ.md            # 常见问题（7 问 7 答）
+│   └── screenshot.png    # 看板效果图
 ├── README.md
 ├── LICENSE
 └── requirements.txt

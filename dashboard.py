@@ -6,6 +6,8 @@
 cwd 编码目录里的全部会话文件（session.jsonl.zstd），收集为「最近任务列表」：
 只保留最近 1 小时内有写入的任务，按文件 mtime 降序取前 8 个；每个任务
 独立解析（阶段 / 动作 / ETA / 事件流），/api/live 返回 {"tasks": [...]}。
+解析结果带缓存：文件 mtime 未变直接复用（4s 轮询不重复解压），会话被
+删除/目录消失时缓存条目自动清理。
 ETA 为「阶段线性外推 + 同目录历史会话耗时中位数」加权融合（详见
 compute_hist_s / blend_eta），历史会话排除任务自身。
 
@@ -39,6 +41,12 @@ RUNNING_AGE = 30      # 文件 mtime 距今 ≤ 30s 视为 running，否则 comp
 # —— 共享状态：后台轮询线程写入，HTTP 线程只读（_LOCK 保护）——
 _LOCK = threading.Lock()
 _STATE = {"tasks": []}   # 最近任务列表快照（scan_tasks 的结果）
+
+# —— 解析缓存：{会话文件路径: (mtime, 解析结果 dict)}；文件 mtime 未变直接复用，
+#    避免 4s 轮询对未变化（尤其已完成）的会话文件反复全量解压（_PARSE_CACHE_LOCK
+#    保证多线程安全：后台轮询线程写 + 测试/并发读）——
+_PARSE_CACHE = {}
+_PARSE_CACHE_LOCK = threading.Lock()
 
 
 def scan_session_files():
@@ -309,11 +317,13 @@ def _task_eta(path, cwd, started_at, marks, k, n):
     return eta_s, eta_mode, eta_at
 
 
-def _build_task(path, status, now):
-    """单个会话文件 → 任务对象 dict；解析失败返回 None（静默跳过，不崩溃）。
+def _parse_task(path):
+    """单个会话文件 → 解析结果 dict（不含依赖 now 的 status/elapsed_s/eta_at）。
 
     复用现有解析函数：_meta_from_lines（id/cwd）、sp.build_progress（阶段/动作）、
-    blend_eta（ETA）、format_tail_line（事件流紧凑文本）。
+    blend_eta（ETA）、format_tail_line（事件流紧凑文本）；解析失败返回 None
+    （静默跳过，不崩溃）。结果带私有键 _started_at（供 _build_task 刷新
+    elapsed_s），对外字段与旧 _build_task 输出一致。
     """
     try:
         lines, events, times, started_at = _read_task(path)
@@ -328,7 +338,6 @@ def _build_task(path, status, now):
         return {
             "id": meta["tag"],
             "cwd": cwd,
-            "status": status,
             "stage": prog.get("stage"),
             "stage_idx": k,
             "stage_total": n,
@@ -337,9 +346,70 @@ def _build_task(path, status, now):
             "eta_s": eta_s,
             "eta_mode": eta_mode,
             "eta_at": eta_at,
-            "elapsed_s": int(now - started_at),
             "tail": format_tail(events, times, TAIL_LINES),
+            "_started_at": started_at,  # 私有键：仅供 elapsed_s 刷新，不对外
         }
+    except Exception:
+        return None  # 单个任务解析失败静默跳过
+
+
+def _parse_task_cached(path):
+    """解析缓存入口：文件 mtime 未变 → 直接复用缓存结果（不重新解压）。
+
+    mtime 变了 / 新文件 / 缓存被清理 → 重新解压解析并更新缓存；
+    文件已不存在（删除/目录消失）→ 返回 None 并清理对应缓存条目。
+    缓存读改写均受 _PARSE_CACHE_LOCK 保护（多线程安全）；解压解析放在
+    锁外执行，避免持锁做 IO。
+    """
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        with _PARSE_CACHE_LOCK:
+            _PARSE_CACHE.pop(path, None)
+        return None
+    with _PARSE_CACHE_LOCK:
+        hit = _PARSE_CACHE.get(path)
+        if hit is not None and hit[0] == mt:
+            return hit[1]  # mtime 未变 → 复用缓存解析结果
+    parsed = _parse_task(path)
+    if parsed is None:
+        return None
+    with _PARSE_CACHE_LOCK:
+        _PARSE_CACHE[path] = (mt, parsed)
+    return parsed
+
+
+def _prune_parse_cache(alive_paths):
+    """扫描后清理解析缓存：不在本次扫描结果里的 key 直接移除。
+
+    会话被删除 / cwd 目录消失 → 文件不再被扫描到 → 对应缓存条目随之
+    失效（只保留仍存在的会话文件，缓存不会无限增长）。
+    """
+    with _PARSE_CACHE_LOCK:
+        stale = [p for p in _PARSE_CACHE if p not in alive_paths]
+        for p in stale:
+            _PARSE_CACHE.pop(p, None)
+
+
+def _build_task(path, status, now):
+    """单个会话文件 → 任务对象 dict；解析失败返回 None（静默跳过，不崩溃）。
+
+    解析结果走 _parse_task_cached 缓存（文件 mtime 未变复用，不重复解压）；
+    仅依赖当前时刻的 status / elapsed_s / eta_at 每次按 now 刷新，与全量
+    解析的字段语义完全一致（/api/live 返回结构不变）。
+    """
+    try:
+        parsed = _parse_task_cached(path)
+        if parsed is None:
+            return None
+        task = dict(parsed)  # 浅拷贝，不污染缓存
+        task["status"] = status
+        task["elapsed_s"] = int(now - task.pop("_started_at"))
+        if task.get("eta_s") is not None:
+            # eta_at = 预计完成时刻：按当前 now 刷新（与全量解析一致）
+            task["eta_at"] = time.strftime("%H:%M:%S",
+                                           time.localtime(now + task["eta_s"]))
+        return task
     except Exception:
         return None  # 单个任务解析失败静默跳过
 
@@ -349,13 +419,16 @@ def scan_tasks(now=None):
 
     - 收集全部会话文件，只保留最近 1 小时内有写入（mtime 距今 < 3600s）的；
     - 按 mtime 降序取前 8 个；
-    - 每个任务独立解析；status：文件 mtime 距今 ≤ 30s → running，否则 completed；
+    - 每个任务独立解析（解析缓存：文件 mtime 未变直接复用，不重复解压）；
+      status：文件 mtime 距今 ≤ 30s → running，否则 completed；
+    - 扫描后清理解析缓存：会话被删除/目录消失 → 对应缓存条目随之失效；
     - 单个会话扫描/解析失败静默跳过；无任务返回 []。
     """
     if now is None:
         now = time.time()
     tasks = []
-    for path, mt in scan_session_files():
+    files = scan_session_files()
+    for path, mt in files:
         age = now - mt
         if age >= RECENT_WINDOW:
             break  # 已按 mtime 降序，之后只会更旧 → 直接结束
@@ -365,6 +438,7 @@ def scan_tasks(now=None):
             tasks.append(task)
         if len(tasks) >= MAX_TASKS:
             break
+    _prune_parse_cache({p for p, _ in files})
     return tasks
 
 

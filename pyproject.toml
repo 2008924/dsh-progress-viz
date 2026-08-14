@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsh-progress-viz"
+version = "0.1.0"
+description = "实时可视化 dsh 任务执行过程的本地看板工具（dsh progress viz: real-time local dashboard for dsh headless tasks）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+dependencies = [
+    "zstandard>=0.21",
+]
+
+# 纯脚本型项目（dashboard.py / session_progress.py 直接运行，无包结构），
+# 不配置 console script 入口（dashboard.py 无 main()，避免大改）；
+# 安装后请直接运行脚本：python dashboard.py [port]
+[tool.setuptools]
+packages = []
