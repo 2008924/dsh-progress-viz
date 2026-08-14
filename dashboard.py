@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""dsh 进度可视化 —— 独立看板服务器（零 dsh-project 依赖，可单独运行）
+"""dsh 进度可视化 —— 多任务分栏看板服务器（零 dsh-project 依赖，可单独运行）
 
 不依赖 dsh_dispatch.py / running.json：直接监控 ~/.dsh/sessions 下**所有**
-cwd 编码目录，取全库最新 mtime 的 session.jsonl.zstd 作为"当前任务"，
-每 4 秒增量解析会话事件流，实时呈现阶段 / ETA / 最近动作 / 事件流。
+cwd 编码目录里的全部会话文件（session.jsonl.zstd），收集为「最近任务列表」：
+只保留最近 1 小时内有写入的任务，按文件 mtime 降序取前 8 个；每个任务
+独立解析（阶段 / 动作 / ETA / 事件流），/api/live 返回 {"tasks": [...]}。
 ETA 为「阶段线性外推 + 同目录历史会话耗时中位数」加权融合（详见
-compute_hist_s / blend_eta）。
+compute_hist_s / blend_eta），历史会话排除任务自身。
 
 用法: python dashboard.py [port]   (默认 8123)
   浏览器打开 http://127.0.0.1:8123
@@ -25,62 +26,52 @@ import session_progress as sp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-POLL_INTERVAL = 4.0   # 轮询间隔（秒）：增量解析会话事件流
+POLL_INTERVAL = 4.0   # 轮询间隔（秒）：重新扫描最近任务列表
 TAIL_LINES = 15       # tail 事件流条数（最近 ~15 个事件）
 TAIL_CUT = 80         # 单条事件文本截断长度（字符）
-_MAX_EVENTS = 10000   # 累积事件封顶（防长会话内存无限增长）
+RECENT_WINDOW = 3600  # 最近任务窗口（秒）：只展示 1 小时内有写入的任务
+MAX_TASKS = 8         # 任务卡片上限（按 mtime 降序取前 8 个）
+RUNNING_AGE = 30      # 文件 mtime 距今 ≤ 30s 视为 running，否则 completed
 
 # —— 共享状态：后台轮询线程写入，HTTP 线程只读（_LOCK 保护）——
 _LOCK = threading.Lock()
-_STATE = {
-    "running": False,
-    "path": None,          # 当前会话文件路径（会话切换时重置增量状态）
-    "tag": None,           # 会话 id 前 8 位（去掉 "session-" 前缀后）
-    "task": None,          # 会话 cwd（当作任务描述展示）
-    "started_at": None,    # epoch 秒（session 事件 createdAt，缺失用首见时间）
-    "seen": 0,             # 已读行数（增量解析游标）
-    "events": [],          # 累积解析事件（封顶 _MAX_EVENTS）
-    "stage": None, "stage_idx": 0, "stage_total": 0, "stage_pct": 0,
-    "action": None,        # 最近工具动作摘要
-    "stage_marks": [],     # 阶段变化时间戳（ETA：marks[0]=任务起点，线性外推+历史均值融合）
-    "eta_s": None, "eta_mode": "none", "eta_at": None,
-    "tail": [],            # 最近 ~15 条事件的紧凑文本行（实时动态流）
-}
+_STATE = {"tasks": []}   # 最近任务列表快照（scan_tasks 的结果）
 
 
-def find_latest_session_all():
-    """全库扫描：返回最新 mtime 的 session.jsonl.zstd 路径；无会话返回 None。
+def scan_session_files():
+    """全库扫描 → 所有会话文件的 (路径, mtime)，按 mtime 降序。
 
     布局：<SESSIONS_ROOT>/<cwd编码>/<session-id>/session.jsonl.zstd
-    （兼容个别把 zstd 直接平铺在编码目录下的情况），按 mtime 取全库最新。
+    （兼容个别把 zstd 直接平铺在编码目录下的情况）。
+    任何目录扫描失败都静默跳过（返回已收集的部分）。
     """
     root = sp.SESSIONS_ROOT
     if not os.path.isdir(root):
-        return None
-    latest, latest_mtime = None, -1.0
+        return []
+    found = []
     try:
         cwd_dirs = os.listdir(root)
     except OSError:
-        return None
+        return []
     for d in cwd_dirs:
         p = os.path.join(root, d)
-        cands = []
         try:
-            if os.path.isdir(p):
-                for name in os.listdir(p):
-                    sub = os.path.join(p, name)
-                    if os.path.isdir(sub):
-                        cands.append(os.path.join(sub, "session.jsonl.zstd"))
-                    elif name.endswith(".zstd"):
-                        cands.append(sub)  # 直接平铺在编码目录下的会话文件
+            if not os.path.isdir(p):
+                continue
+            for name in os.listdir(p):
+                sub = os.path.join(p, name)
+                if os.path.isdir(sub):
+                    f = os.path.join(sub, "session.jsonl.zstd")
+                elif name.endswith(".zstd"):
+                    f = sub  # 直接平铺在编码目录下的会话文件
+                else:
+                    continue
+                if os.path.isfile(f):
+                    found.append((f, os.path.getmtime(f)))
         except OSError:
-            continue
-        for f in cands:
-            if os.path.isfile(f):
-                mt = os.path.getmtime(f)
-                if mt > latest_mtime:
-                    latest, latest_mtime = f, mt
-    return latest
+            continue  # 单个目录扫描失败静默跳过
+    found.sort(key=lambda x: x[1], reverse=True)  # 按 mtime 降序
+    return found
 
 
 def _meta_from_lines(lines):
@@ -167,6 +158,148 @@ def format_tail_line(ev):
     elif typ == "step/start" and isinstance(data, dict):
         text = f"step/start: 步骤{data.get('step', '')}"
     return text[:TAIL_CUT]
+
+
+def _read_task(path):
+    """读取单个会话文件 → (lines, events, times, started_at)；失败返回全 None。
+
+    复用 sp.tail_session / sp.parse_event；times 为各事件顶层 time（秒），
+    session 事件无 time 时用 createdAt 兜底；started_at 取首个有效时间。
+    """
+    try:
+        lines, _ = sp.tail_session(path, 0)
+    except Exception:
+        return None, None, None, None
+    events, times = [], []
+    started_at = None
+    for ln in lines:
+        ev = sp.parse_event(ln)
+        if ev is None:
+            continue
+        events.append(ev)
+        t_ms = None
+        try:
+            obj = json.loads(ln)
+            if isinstance(obj, dict):
+                t_ms = obj.get("time")
+                if not isinstance(t_ms, (int, float)) or t_ms <= 0:
+                    # session 事件无 time 时用 createdAt 兜底
+                    t_ms = obj.get("createdAt") if obj.get("type") == "session" else None
+        except (json.JSONDecodeError, ValueError):
+            pass
+        t = t_ms / 1000.0 if isinstance(t_ms, (int, float)) and t_ms > 0 else None
+        times.append(t)
+        if t is not None and started_at is None:
+            started_at = t
+    if not events:
+        return None, None, None, None
+    return lines, events, times, started_at
+
+
+def _stage_marks(events, times, started_at):
+    """阶段变化时间戳列表（秒）：起点=started_at，之后每次阶段变化追加。
+
+    与 sp.build_progress 同规则（todo 清单优先 / step/start 兜底），
+    线性扫描一次；阶段变化用对应事件的 time（无 time 时用起点近似）。
+    供 blend_eta 的线性外推使用（marks[0]=任务起点）。
+    """
+    marks = [started_at]
+    todo_count, todo_items, step_count = 0, None, 0
+    cur_idx, cur_total = 0, 0
+    for ev, t in zip(events, times):
+        typ, data = ev
+        changed = False
+        if typ == "todo/write" and isinstance(data, dict):
+            todo_count += 1
+            items = data.get("items") or data.get("todos")
+            if isinstance(items, list) and items:
+                todo_items = items
+                idx, total = sp._pick_todo_stage(items, todo_count)
+                if (idx, total) != (cur_idx, cur_total):
+                    cur_idx, cur_total = idx, total
+                    changed = True
+        elif typ == "step/start" and todo_items is None:
+            step_count += 1  # 无 todo 时 step/start 计数兜底
+            if step_count != cur_idx:
+                cur_idx = step_count
+                changed = True
+        if changed:
+            marks.append(t if t is not None else started_at)
+    return marks
+
+
+def _task_eta(path, cwd, started_at, marks, k, n):
+    """单个任务的 ETA 融合（复用 blend_eta；历史会话排除任务自身）。
+
+    返回 (eta_s, eta_mode, eta_at)；无可用信息时 eta_s=None。
+    """
+    state = {"started_at": started_at, "stage_marks": marks,
+             "stage_idx": k, "stage_total": n}
+    hist_s = compute_hist_s(cwd, path)
+    eta_s, eta_mode = blend_eta(state, hist_s)
+    eta_at = (time.strftime("%H:%M:%S",
+              time.localtime(time.time() + eta_s))
+              if eta_s is not None else None)
+    return eta_s, eta_mode, eta_at
+
+
+def _build_task(path, status, now):
+    """单个会话文件 → 任务对象 dict；解析失败返回 None（静默跳过，不崩溃）。
+
+    复用现有解析函数：_meta_from_lines（id/cwd）、sp.build_progress（阶段/动作）、
+    blend_eta（ETA）、format_tail_line（事件流紧凑文本）。
+    """
+    try:
+        lines, events, times, started_at = _read_task(path)
+        if not events or started_at is None:
+            return None
+        meta = _meta_from_lines(lines)
+        cwd = meta["task"]
+        prog = sp.build_progress(events)
+        k, n = prog.get("stage_idx", 0), prog.get("stage_total", 0)
+        marks = _stage_marks(events, times, started_at)
+        eta_s, eta_mode, eta_at = _task_eta(path, cwd, started_at, marks, k, n)
+        return {
+            "id": meta["tag"],
+            "cwd": cwd,
+            "status": status,
+            "stage": prog.get("stage"),
+            "stage_idx": k,
+            "stage_total": n,
+            "stage_pct": round(k / n * 100) if n else 0,
+            "action": prog.get("action"),
+            "eta_s": eta_s,
+            "eta_mode": eta_mode,
+            "eta_at": eta_at,
+            "elapsed_s": int(now - started_at),
+            "tail": [format_tail_line(e) for e in events[-TAIL_LINES:]],
+        }
+    except Exception:
+        return None  # 单个任务解析失败静默跳过
+
+
+def scan_tasks(now=None):
+    """全库扫描 → 最近任务列表（多任务分栏数据源）。
+
+    - 收集全部会话文件，只保留最近 1 小时内有写入（mtime 距今 < 3600s）的；
+    - 按 mtime 降序取前 8 个；
+    - 每个任务独立解析；status：文件 mtime 距今 ≤ 30s → running，否则 completed；
+    - 单个会话扫描/解析失败静默跳过；无任务返回 []。
+    """
+    if now is None:
+        now = time.time()
+    tasks = []
+    for path, mt in scan_session_files():
+        age = now - mt
+        if age >= RECENT_WINDOW:
+            break  # 已按 mtime 降序，之后只会更旧 → 直接结束
+        status = "running" if age <= RUNNING_AGE else "completed"
+        task = _build_task(path, status, now)
+        if task is not None:
+            tasks.append(task)
+        if len(tasks) >= MAX_TASKS:
+            break
+    return tasks
 
 
 # —— ETA 历史会话缓存：{会话目录: (目录 mtime, hist_s)}，mtime 未变时复用 ——
@@ -303,73 +436,14 @@ def blend_eta(state, hist_s):
     return (None, "none")
 
 
-def _refresh_progress(st):
-    """从累积事件刷新阶段/动作/ETA/tail（写入 _STATE 字典）。"""
-    prog = sp.build_progress(st["events"])
-    stage = prog.get("stage")
-    if stage and stage != st["stage"]:
-        st["stage_marks"].append(time.time())  # 阶段变化 → 追加时间戳
-    st["stage"] = stage
-    st["stage_idx"] = prog.get("stage_idx", 0)
-    st["stage_total"] = prog.get("stage_total", 0)
-    st["action"] = prog.get("action")
-    n = st["stage_total"]
-    st["stage_pct"] = round(st["stage_idx"] / n * 100) if n else 0
-    # ETA 融合：线性外推 + 同目录历史会话耗时中位数加权（4s 轮询，目录 mtime 缓存）
-    hist_s = compute_hist_s(st.get("task"), st.get("path"))
-    st["eta_s"], st["eta_mode"] = blend_eta(st, hist_s)
-    st["eta_at"] = (time.strftime("%H:%M:%S",
-                    time.localtime(time.time() + st["eta_s"]))
-                    if st["eta_s"] is not None else None)
-    st["tail"] = [format_tail_line(e) for e in st["events"][-TAIL_LINES:]]
-
-
 def poll_once():
-    """单次轮询：全库扫描 + 增量解析 → 更新共享状态。任何异常静默。"""
+    """单次轮询：全库扫描最近任务 → 更新共享状态。任何异常静默。"""
     try:
-        path = find_latest_session_all()
+        tasks = scan_tasks()
         with _LOCK:
-            st = _STATE
-            if not path:
-                # 无会话 → running=false，清空旧状态
-                st.update(running=False, path=None, tag=None, task=None,
-                          started_at=None, seen=0, events=[], stage=None,
-                          stage_idx=0, stage_total=0, stage_pct=0,
-                          action=None, stage_marks=[], eta_s=None,
-                          eta_mode="none", eta_at=None, tail=[])
-                return
-            if st["path"] != path:
-                # 换了新会话（新任务）→ 重置增量状态并解析元信息
-                st.update(path=path, seen=0, events=[], stage_marks=[],
-                          tag=None, task=None, started_at=None, stage=None,
-                          stage_idx=0, stage_total=0, stage_pct=0,
-                          action=None, eta_s=None, eta_mode="none",
-                          eta_at=None, tail=[])
-                lines0, total0 = sp.tail_session(path, 0)
-                meta = _meta_from_lines(lines0)
-                st["tag"] = meta["tag"]
-                st["task"] = meta["task"]
-                st["started_at"] = meta["started_at"] or time.time()
-                st["stage_marks"].append(st["started_at"])  # 起点 mark
-                st["seen"] = max(st["seen"], total0)
-                for ln in lines0:
-                    ev = sp.parse_event(ln)
-                    if ev:
-                        st["events"].append(ev)
-            else:
-                new_lines, total = sp.tail_session(path, st["seen"])
-                if total >= st["seen"]:
-                    st["seen"] = total
-                for ln in new_lines:
-                    ev = sp.parse_event(ln)
-                    if ev:
-                        st["events"].append(ev)
-            if len(st["events"]) > _MAX_EVENTS:
-                st["events"] = st["events"][-_MAX_EVENTS:]
-            st["running"] = True
-            _refresh_progress(st)
+            _STATE["tasks"] = tasks
     except Exception:
-        pass  # 解压/解析失败全部静默，绝不崩溃
+        pass  # 扫描/解析失败全部静默，绝不崩溃
 
 
 def poll_loop():
@@ -383,26 +457,14 @@ def poll_loop():
 
 
 def live_payload():
-    """/api/live 响应：当前任务状态 JSON（字段名与现有看板兼容）。"""
+    """/api/live 响应：最近任务列表 JSON（多任务分栏）。
+
+    兼容说明：原单任务顶层字段（running/tag/task/...）不再返回，
+    前端已同步改为 {"tasks": [...]}；无任务时 tasks=[]。
+    """
     with _LOCK:
-        st = dict(_STATE)
-    return {
-        "running": st["running"],
-        "tag": st["tag"],
-        "task": st["task"],
-        "stage": st["stage"],
-        "stage_idx": st["stage_idx"],
-        "stage_total": st["stage_total"],
-        "stage_pct": st["stage_pct"],
-        "action": st["action"],
-        "eta_s": st["eta_s"],
-        "eta_mode": st["eta_mode"],
-        "eta_at": st["eta_at"],
-        "elapsed_s": int(time.time() - st["started_at"]) if st["started_at"] else 0,
-        "tail": st["tail"],
-        "started_at": st["started_at"],
-        "timeout_s": None,
-    }
+        tasks = list(_STATE["tasks"])
+    return {"tasks": tasks}
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -6,32 +6,38 @@
 <style>
   body { font-family: "Microsoft YaHei", sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 20px; }
   h1 { font-size: 20px; border-bottom: 1px solid #2a2d35; padding-bottom: 10px; }
-  h2 { font-size: 15px; color: #8b93a7; margin-top: 24px; }
-  .card { background: #171a21; border: 1px solid #2a2d35; border-radius: 8px; padding: 14px 18px; margin: 8px 0; }
+  .muted { color: #8b93a7; font-size: 12px; font-weight: normal; }
+  /* 多任务网格分栏：≥1400px 3 列 / ≥900px 2 列 / 其余 1 列（响应式） */
+  .grid { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 14px; }
+  @media (min-width: 900px)  { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (min-width: 1400px) { .grid { grid-template-columns: repeat(3, 1fr); } }
+  .card { background: #171a21; border: 1px solid #2a2d35; border-radius: 8px; padding: 14px 18px; }
+  .card-running { border-color: #14532d; }
+  .card-completed { opacity: 0.85; }
   .ok { color: #4ade80; font-weight: bold; }
-  .muted { color: #8b93a7; font-size: 12px; }
-  .bar { background: #22262f; border-radius: 4px; height: 6px; margin: 6px 0; overflow: hidden; }
-  .bar-inner { background: #4ade80; height: 100%; border-radius: 4px; transition: width 0.5s; }
+  .done { color: #9ca3af; font-weight: bold; }
+  .badge { display: inline-block; background: #2a2d35; border-radius: 10px; padding: 2px 10px; font-size: 12px; margin-left: 8px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-running { background: #4ade80; animation: pulse 1s infinite; }
+  .dot-done { background: #6b7280; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .card-title { font-size: 13px; color: #8b93a7; margin-top: 8px; word-break: break-all; }
+  .stage-name { font-size: 14px; font-weight: bold; color: #93c5fd; }
   .stage-bar { background: #22262f; border-radius: 6px; height: 10px; margin: 8px 0 4px; overflow: hidden; }
   .stage-bar-inner { background: linear-gradient(90deg, #60a5fa, #a78bfa); height: 100%; border-radius: 6px; transition: width 0.5s; }
-  .stage-name { font-size: 14px; font-weight: bold; color: #93c5fd; }
-  .eta { font-size: 14px; color: #fbbf24; font-weight: bold; }
+  .eta { font-size: 13px; color: #fbbf24; font-weight: bold; }
   .eta-muted { color: #8b93a7; font-size: 12px; font-weight: normal; }
-  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .dot-running { background: #60a5fa; animation: pulse 1s infinite; }
-  .dot-done { background: #4ade80; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-  .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
-  #running-status { font-size: 14px; }
-  .badge { display: inline-block; background: #2a2d35; border-radius: 10px; padding: 2px 10px; font-size: 12px; margin-left: 8px; }
   .action { margin-top: 6px; font-size: 13px; }
+  .tail-btn { margin-top: 8px; cursor: pointer; color: #60a5fa; font-size: 13px; user-select: none; }
+  .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; margin-top: 6px; }
+  .pre.collapse { display: none; }        /* 已完成卡片：事件流默认折叠 */
+  .pre.collapse.open { display: block; }  /* 点击展开 */
 </style>
 </head>
 <body>
-<h1>📊 dsh Progress Viz <span class="muted">(每 5 秒自动刷新)</span></h1>
+<h1>📊 dsh Progress Viz <span class="muted" id="count">共 0 个任务 · 每 5 秒自动刷新</span></h1>
 
-<h2>📡 当前任务</h2>
-<div class="card" id="running-status">查询中...</div>
+<div class="grid" id="grid">查询中...</div>
 
 <script>
 function fmtDur(s) {
@@ -40,47 +46,91 @@ function fmtDur(s) {
   if (s >= 60) return Math.floor(s/60) + 'm ' + (s%60) + 's';
   return s + 's';
 }
+// ETA 推算方式文案（沿用现有：blend/linear/history/none）
+function modeTxt(mode) {
+  return mode === 'linear' ? '按阶段速度推算'
+    : mode === 'blend' ? '按阶段速度+历史均值融合推算'
+    : mode === 'history' ? '按历史会话均值推算'
+    : '';
+}
+// 转义会话数据里的 HTML 特殊字符（cwd/阶段名/动作/事件流来自本地文件，防御性处理）
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function tailLines(t) {
+  return t.tail && t.tail.length ? esc(t.tail.join('\n')) : '(暂无事件...)';
+}
+// 单个任务卡片（i 用于生成事件流元素的唯一 id）
+function cardHtml(t, i) {
+  const running = t.status === 'running';
+  const dot = running ? 'dot-running' : 'dot-done';
+  const label = running ? '正在运行' : '已完成';
+  const cls = running ? 'ok' : 'done';
+  const id = t.id ? '<span class="badge">' + esc(t.id) + '</span>' : '';
+  const stage = t.stage || (t.stage_idx ? '步骤' + t.stage_idx : '');
+  let html = '<div class="card ' + (running ? 'card-running' : 'card-completed') + '">';
+  html += '<div><span class="status-dot ' + dot + '"></span><span class="' + cls + '">' + label + '</span>' + id +
+    '<span class="muted">' + (running ? '已运行 ' : '耗时 ') + fmtDur(t.elapsed_s) + '</span></div>';
+  html += '<div class="card-title">' + esc(t.cwd || '(未知目录)') + '</div>';
+  if (running) {
+    // 运行中卡片：阶段进度条
+    if (t.stage_idx && t.stage_total) {
+      const pct = t.stage_pct || Math.round(t.stage_idx / t.stage_total * 100);
+      html += '<div style="margin-top:10px;">' +
+        '<span class="stage-name">阶段 ' + t.stage_idx + '/' + t.stage_total + ' · ' + esc(stage) + '</span>' +
+        '<span class="muted" style="float:right">' + pct + '%</span>' +
+        '<div class="stage-bar"><div class="stage-bar-inner" style="width:' + pct + '%"></div></div></div>';
+    }
+    // 运行中卡片：ETA（预计完成时刻 + 剩余 + 推算方式）
+    if (t.eta_at) {
+      const mt = modeTxt(t.eta_mode);
+      html += '<div style="margin-top:6px;"><span class="eta">⏱ 预计完成 ' + esc(t.eta_at) +
+        ' <span class="eta-muted">(剩余 ' + fmtDur(t.eta_s) + (mt ? ' · ' + mt : '') + ')</span></span></div>';
+    }
+    if (t.action) {
+      html += '<div class="action"><span class="muted">最近动作:</span> ' + esc(t.action) + '</div>';
+    }
+    // 运行中卡片：事件流默认展开（max-height 滚动）
+    html += '<div class="pre">' + tailLines(t) + '</div>';
+  } else {
+    // 已完成卡片：最后阶段名 + 事件流默认折叠（点击展开，防信息过载）
+    html += '<div class="action"><span class="muted">最后阶段:</span> ' + esc(stage || '(无阶段信息)') + '</div>';
+    if (t.action) {
+      html += '<div class="action"><span class="muted">最近动作:</span> ' + esc(t.action) + '</div>';
+    }
+    const tid = 'tail-' + i;
+    html += '<div class="tail-btn" onclick="toggleTail(\'' + tid + '\')" id="' + tid + '-btn">📜 事件流（点击展开）</div>';
+    html += '<div class="pre collapse" id="' + tid + '">' + tailLines(t) + '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+// 已完成卡片：点击切换事件流展开/折叠
+function toggleTail(id) {
+  const el = document.getElementById(id);
+  const btn = document.getElementById(id + '-btn');
+  const open = el.classList.toggle('open');
+  btn.textContent = open ? '📜 事件流（点击折叠）' : '📜 事件流（点击展开）';
+}
 async function load() {
   try {
     const res = await fetch('/api/live');
     const live = await res.json();
-    const rs = document.getElementById('running-status');
-    if (live.running) {
-      let html = '<span class="status-dot dot-running"></span><span class="ok">正在运行</span>' +
-        (live.tag ? '<span class="badge">' + live.tag + '</span>' : '') +
-        '<span class="muted">任务 ' + (live.task || '') + ' · 已运行 ' + fmtDur(live.elapsed_s) + '</span>';
-      // 阶段进度条
-      if (live.stage_idx && live.stage_total) {
-        const pct = live.stage_pct || Math.round(live.stage_idx / live.stage_total * 100);
-        html += '<div style="margin-top:10px;">' +
-          '<span class="stage-name">阶段 ' + live.stage_idx + '/' + live.stage_total + ' · ' + (live.stage || '') + '</span>' +
-          '<span class="muted" style="float:right">' + pct + '%</span>' +
-          '<div class="stage-bar"><div class="stage-bar-inner" style="width:' + pct + '%"></div></div></div>';
-      }
-      // ETA
-      if (live.eta_at) {
-        const modeTxt = live.eta_mode === 'linear' ? '按阶段速度推算'
-          : live.eta_mode === 'blend' ? '按阶段速度+历史均值融合推算'
-          : live.eta_mode === 'history' ? '按历史会话均值推算'
-          : '';
-        html += '<div style="margin-top:6px;"><span class="eta">⏱ 预计完成 ' + live.eta_at +
-          ' <span class="eta-muted">(剩余 ' + fmtDur(live.eta_s) + (modeTxt ? ' · ' + modeTxt : '') + ')</span></span></div>';
-      }
-      // 最近动作
-      if (live.action) {
-        html += '<div class="action"><span class="muted">最近动作:</span> ' + live.action + '</div>';
-      }
-      // tail：事件流（headless 无 stdout，事件流就是任务的"输出"）
-      html += '<h2>📜 事件流</h2>' +
-        '<div class="pre">' + (live.tail && live.tail.length ? live.tail.join('\n') : '(暂无事件...)') + '</div>';
-      rs.innerHTML = html;
-    } else {
-      rs.innerHTML = '<span class="status-dot dot-done"></span> 等待 dsh 任务开始...' +
-        '<div class="muted" style="margin-top:8px;">未在 ~/.dsh/sessions 下发现会话，' +
-        '启动一个 dsh headless 任务后，这里会自动显示阶段 / ETA / 事件流。</div>';
+    const tasks = live.tasks || [];
+    document.getElementById('count').textContent =
+      '共 ' + tasks.length + ' 个任务 · 每 5 秒自动刷新';
+    const grid = document.getElementById('grid');
+    if (!tasks.length) {
+      // 空状态：无任务
+      grid.innerHTML = '<div class="card"><span class="status-dot dot-done"></span> 等待 dsh 任务开始...' +
+        '<div class="muted" style="margin-top:8px;">未在最近 1 小时内发现 ~/.dsh/sessions 下的会话，' +
+        '启动一个 dsh headless 任务后，这里会自动显示多任务分栏（阶段 / ETA / 事件流）。</div></div>';
+      return;
     }
+    grid.innerHTML = tasks.map(cardHtml).join('');
   } catch (e) {
-    document.getElementById('running-status').textContent = '看板 API 不可用: ' + e.message;
+    document.getElementById('grid').textContent = '看板 API 不可用: ' + e.message;
   }
 }
 load();

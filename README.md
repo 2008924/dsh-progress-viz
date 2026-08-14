@@ -32,7 +32,7 @@ dsh 会把每次任务的完整事件流实时追加写入本地会话文件：
 | `step/start` | 步骤边界 | 无 todo 时的兜底计数 |
 | `tool/call` | 工具调用（`data.name` + `data.arguments`） | 最近动作 + 事件流 |
 
-解压必须用 zstandard 的 `stream_reader` 全量流式解压（`decompressobj` 只能解第一个 frame 是已知的坑）。看板每 4 秒增量轮询一次（跳过已处理行数），页面每 5 秒自动刷新。
+解压必须用 zstandard 的 `stream_reader` 全量流式解压（`decompressobj` 只能解第一个 frame 是已知的坑）。看板每 4 秒轮询一次（重新扫描最近任务列表并逐任务解析），页面每 5 秒自动刷新。
 
 ## 安装与快速开始
 
@@ -45,10 +45,21 @@ python dashboard.py 8123
 
 浏览器打开 <http://127.0.0.1:8123>：
 
-- **有任务运行时**：显示当前阶段（阶段 k/N + 名称 + 进度条）、ETA、最近动作与事件流；
-- **无任务时**：显示"等待 dsh 任务开始..."，开始一个 dsh headless 任务后自动出现进度。
+- **多任务分栏**：看板扫描 `~/.dsh/sessions` 下**全部**会话，只保留**最近 1 小时**内有写入
+  （文件 mtime 距今 < 3600s）的任务，按 mtime 降序取**前 8 个**，以网格分栏展示
+  （≥1400px 三列 / ≥900px 两列 / 其余单列，响应式）；
+- **运行中卡片**（mtime 距今 ≤ 30s）：绿色状态点「正在运行」+ 任务 cwd + 会话 id（前 8 位）+
+  已运行时长 + 阶段进度条（阶段 k/N + 名称）+ ETA（预计完成时刻 + 剩余时间 + 推算方式）+
+  事件流（默认展开，max-height 滚动）；
+- **已完成卡片**（mtime 距今 > 30s）：灰色「已完成」+ cwd + 耗时 + 最后阶段名
+  （stage 或「步骤N」），事件流**默认折叠**（点击展开），避免信息过载；
+- **无任务时**：显示"等待 dsh 任务开始..."，启动一个 dsh headless 任务后自动出现分栏；
+- 标题区实时显示任务总数（如「共 3 个任务 · 每 5 秒自动刷新」）。
 
-`/api/live` 返回当前任务状态 JSON（`running/tag/task/stage/stage_idx/stage_total/stage_pct/action/eta_s/eta_mode/eta_at/elapsed_s/tail/started_at/timeout_s`）。
+`/api/live` 返回最近任务列表 JSON：`{"tasks": [ {id, cwd, status, stage, stage_idx,
+stage_total, stage_pct, action, eta_s, eta_mode, eta_at, elapsed_s, tail} ]}`，
+无任务时 `tasks=[]`。每个任务的 ETA 独立计算（融合算法复用，历史会话排除任务自身）；
+单个会话扫描/解析失败会静默跳过，不影响其他任务。
 
 ## 阶段与 ETA 说明
 
@@ -76,19 +87,21 @@ python dashboard.py 8123
 python tests\make_fixtures.py          # 生成合成 fixtures（无真实会话数据）
 python tests\test_session_progress.py  # 跑全部单测（无需 pytest），exit 0 全过
 python tests\test_eta_blend.py         # ETA 融合算法单测（历史会话 fixture 生成到临时目录）
+python tests\test_multi_pane.py        # 多任务分栏单测（1 小时窗口 / mtime 排序 / status 判定）
 ```
 
 ## 文件结构
 
 ```
 dsh-progress-viz/
-├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 增量轮询 + ETA）
+├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 轮询 + 多任务分栏 + ETA）
 ├── session_progress.py   # 会话事件流 → 阶段解析器（纯本地）
-├── index.html            # 看板页面（深色主题，5s 自动刷新）
+├── index.html            # 看板页面（深色主题，多任务网格分栏，5s 自动刷新）
 ├── tests/
 │   ├── make_fixtures.py              # 合成 fixtures 生成器（含历史会话 fixture）
 │   ├── test_session_progress.py      # 单测（无需 pytest）
 │   ├── test_eta_blend.py             # ETA 融合算法单测
+│   ├── test_multi_pane.py            # 多任务分栏单测
 │   └── fixtures/session-synthetic.jsonl.zstd
 ├── README.md
 ├── LICENSE
