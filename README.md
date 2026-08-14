@@ -26,13 +26,15 @@ dsh 会把每次任务的完整事件流实时追加写入本地会话文件：
 
 （zstd 压缩的 JSONL，每行一个事件，`type` 字段区分类型。）
 
-本工具只关心三类事件：
+本工具关心的事件（v1.1 扩展后）：
 
 | 事件类型 | 含义 | 用途 |
 | --- | --- | --- |
 | `todo/write` | 模型写入任务清单（`data.todos`，每项有 `content` + `status`） | **阶段数据源**：取第一个未完成项为当前阶段 |
 | `step/start` | 步骤边界 | 无 todo 时的兜底计数 |
-| `tool/call` | 工具调用（`data.name` + `data.arguments`） | 最近动作 + 事件流 |
+| `tool/call` | 工具调用（`data.name` + `data.arguments`） | 最近动作 + 事件流/时间线 |
+| `session/title` | dsh 自动生成的任务标题（`data.title`） | **任务标题**（卡片优先显示，无标题回退 cwd basename） |
+| `assistant/message` | 模型消息（`data.usage` 含 token 统计） | **成本估算**：累计 tokens × DeepSeek 定价常量 |
 
 解压必须用 zstandard 的 `stream_reader` 全量流式解压（`decompressobj` 只能解第一个 frame 是已知的坑）。看板每 4 秒轮询一次（重新扫描最近任务列表并逐任务解析），页面每 5 秒自动刷新。
 
@@ -59,25 +61,50 @@ python dashboard.py 8123        # 或 python -m dashboard 8123
 - **端口冲突自动递增**：指定端口（或默认 8123）被占用时自动 +1 重试
   （最多 5 次），并打印「端口 X 被占用，改用 Y」；连续 5 个端口都被占用才报错退出；
 - **`--no-open`**：启动时不自动打开浏览器（如远程/无头环境）：
-  `python dashboard.py 8123 --no-open`。
+  `python dashboard.py 8123 --no-open`；
+- **`--status`**：不启动服务器，直接打印当前任务状态表
+  （状态 / 标题 / 阶段 k/N / ETA / 成本）后退出（exit 0），无任务打印「暂无任务」：
+  `python dashboard.py --status`；
+- **飞书完成通知**：`--feishu-webhook <URL>`（或环境变量 `FEISHU_WEBHOOK`）启用——
+  任务从 running 变为 completed 时（看板轮询检测到状态翻转）向 webhook POST 一条
+  文本消息「✅ dsh 任务完成：<标题>（<cwd>）· 耗时 <mm:ss> · 阶段 <最后阶段>」；
+  同一会话只通知一次（缓存已通知会话 id），启动时已 completed 的任务不通知，
+  发送失败静默（不阻塞看板）；`--no-feishu` 强制关闭。
 
 浏览器打开 <http://127.0.0.1:8123>：
 
 - **多任务分栏**：看板扫描 `~/.dsh/sessions` 下**全部**会话，只保留**最近 1 小时**内有写入
   （文件 mtime 距今 < 3600s）的任务，按 mtime 降序取**前 8 个**，以网格分栏展示
   （≥1400px 三列 / ≥900px 两列 / 其余单列，响应式）；
-- **运行中卡片**（mtime 距今 ≤ 30s）：绿色状态点「正在运行」+ 任务 cwd + 会话 id（前 8 位）+
+- **运行中卡片**（mtime 距今 ≤ 30s）：绿色状态点「正在运行」+ 任务标题 + cwd + 会话 id（前 8 位）+
   已运行时长 + 阶段进度条（阶段 k/N + 名称）+ ETA（预计完成时刻 + 剩余时间 + 推算方式）+
+  成本估算（有 usage 数据才显示）+ 「详情」展开区（点击展开完整时间线，等宽字体）+
   事件流（默认展开，max-height 滚动）；
-- **已完成卡片**（mtime 距今 > 30s）：灰色「已完成」+ cwd + 耗时 + 最后阶段名
+- **已完成卡片**（mtime 距今 > 30s）：灰色「已完成」+ 标题 + cwd + 耗时 + 最后阶段名
   （stage 或「步骤N」），事件流**默认折叠**（点击展开），避免信息过载；
 - **无任务时**：显示"等待 dsh 任务开始..."，启动一个 dsh headless 任务后自动出现分栏；
 - 标题区实时显示任务总数（如「共 3 个任务 · 每 5 秒自动刷新」）。
 
-`/api/live` 返回最近任务列表 JSON：`{"tasks": [ {id, cwd, status, stage, stage_idx,
-stage_total, stage_pct, action, eta_s, eta_mode, eta_at, elapsed_s, tail} ]}`，
-无任务时 `tasks=[]`。每个任务的 ETA 独立计算（融合算法复用，历史会话排除任务自身）；
-单个会话扫描/解析失败会静默跳过，不影响其他任务。
+`/api/live` 返回最近任务列表 JSON：`{"tasks": [ {id, cwd, title, status, stage,
+stage_idx, stage_total, stage_pct, action, eta_s, eta_mode, eta_at, elapsed_s,
+tail, cost_est, timeline} ]}`，无任务时 `tasks=[]`。每个任务的 ETA 独立计算
+（融合算法复用，历史会话排除任务自身）；单个会话扫描/解析失败会静默跳过，
+不影响其他任务。
+
+## v1.1 新功能说明
+
+- **成本显示（A）**：解析 `assistant/message`（或 `tool/result`）事件的
+  `data.usage`（实测本机格式：`inputTokens` / `outputTokens` / `cacheReadTokens`），
+  按模块级常量 `PRICES`（DeepSeek 官方定价，元/百万 tokens，注释标明价格与日期、
+  可改）估算成本，卡片显示「≈¥0.0123」并标注**估算**。事件流无 usage 数据时
+  `cost_est` 置 `None`，前端不显示（不硬编假数据）。
+- **任务标题（D）**：解析 `session/title` 事件的 `data.title`（取最后一个非空），
+  任务卡片优先显示标题；无标题回退 cwd 的 basename；再回退完整 cwd。
+- **CLI 状态查询（C）**：`--status` 不启动服务器，直接打印当前任务状态表。
+- **飞书完成通知（B）**：`--feishu-webhook` / `FEISHU_WEBHOOK` 启用；任务
+  running→completed 翻转时通知一次（去重），启动时已 completed 不通知，失败静默。
+- **详情时间线（E）**：`/api/live` 任务对象新增 `timeline` 字段（`[{t, type, desc}]`，
+  最多 50 条，chunk 连续合并、取最近）；运行中卡片「详情」点击展开。
 
 ## 阶段与 ETA 说明
 
@@ -109,6 +136,7 @@ python tests/test_multi_pane.py        # 多任务分栏单测（1 小时窗口 
 python tests/test_tail_format.py       # tail 可读性单测（chunk 合并 / 时间戳 / 动作高亮 / 截断）
 python tests/test_port.py              # 端口冲突自动递增单测（socket 占用模拟，随机高位端口）
 python tests/test_cache.py             # 解析缓存单测（mtime 未变不重新解压 / 修改后重解析 / 缓存清理）
+python tests/test_v11.py               # v1.1 五项增强单测（标题 / 成本 / CLI --status / 飞书通知 / 时间线）
 ```
 
 GitHub Actions CI（`.github/workflows/ci.yml`）在 push 到 main 与 pull_request 时，
@@ -125,9 +153,10 @@ GitHub Actions CI（`.github/workflows/ci.yml`）在 push 到 main 与 pull_requ
 ```
 dsh-progress-viz/
 ├── .github/workflows/ci.yml # GitHub Actions CI（3 平台 × 2 Python 矩阵）
-├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 轮询 + 解析缓存 + 多任务分栏 + ETA）
+├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 轮询 + 解析缓存 + 多任务分栏 +
+│                         #   ETA + 成本估算 + 任务标题 + 详情时间线 + 飞书完成通知 + CLI --status）
 ├── session_progress.py   # 会话事件流 → 阶段解析器（纯本地）
-├── index.html            # 看板页面（深色主题，多任务网格分栏，5s 自动刷新）
+├── index.html            # 看板页面（深色主题，多任务网格分栏，标题/成本/详情时间线，5s 自动刷新）
 ├── pyproject.toml        # 项目元信息 / 依赖声明（pip install . 用）
 ├── tests/
 │   ├── make_fixtures.py              # 合成 fixtures 生成器（含历史会话 fixture）
@@ -137,6 +166,7 @@ dsh-progress-viz/
 │   ├── test_tail_format.py           # tail 可读性单测
 │   ├── test_port.py                  # 端口冲突自动递增单测
 │   ├── test_cache.py                 # 解析缓存单测
+│   ├── test_v11.py                   # v1.1 五项增强单测（标题/成本/CLI/飞书/时间线）
 │   └── fixtures/session-synthetic.jsonl.zstd
 ├── docs/
 │   ├── FAQ.md            # 常见问题（7 问 7 答）

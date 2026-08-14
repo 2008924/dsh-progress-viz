@@ -5,15 +5,22 @@
 不依赖 dsh_dispatch.py / running.json：直接监控 ~/.dsh/sessions 下**所有**
 cwd 编码目录里的全部会话文件（session.jsonl.zstd），收集为「最近任务列表」：
 只保留最近 1 小时内有写入的任务，按文件 mtime 降序取前 8 个；每个任务
-独立解析（阶段 / 动作 / ETA / 事件流），/api/live 返回 {"tasks": [...]}。
-解析结果带缓存：文件 mtime 未变直接复用（4s 轮询不重复解压），会话被
-删除/目录消失时缓存条目自动清理。
+独立解析（阶段 / 动作 / ETA / 标题 / 成本 / 事件流 / 时间线），/api/live
+返回 {"tasks": [...]}。解析结果带缓存：文件 mtime 未变直接复用（4s 轮询不
+重复解压），会话被删除/目录消失时缓存条目自动清理。
 ETA 为「阶段线性外推 + 同目录历史会话耗时中位数」加权融合（详见
 compute_hist_s / blend_eta），历史会话排除任务自身。
+成本为 DeepSeek 定价**估算**（usage tokens × PRICES，字段 cost_est，
+无 usage 数据时为 None 且前端不显示）；任务标题优先 session/title 事件。
+飞书完成通知：任务 running→completed 翻转时向 webhook POST 文本消息
+（同一会话只通知一次，启动时已 completed 不通知，失败静默）。
 
 用法: python dashboard.py [port]   (默认 8123)
   启动成功后自动用默认浏览器打开 http://127.0.0.1:<实际端口>
   （--no-open 关闭自动打开）；端口被占用时自动 +1 递增（最多 5 次）。
+  --status：不启动服务器，直接打印当前任务状态表后退出（exit 0）。
+  --feishu-webhook <URL>（或环境变量 FEISHU_WEBHOOK）：启用飞书完成通知；
+  --no-feishu 强制关闭。
 
 纯本地运行，任何解压/解析失败都静默容忍，绝不崩溃。
 """
@@ -23,6 +30,7 @@ import os
 import socket
 import threading
 import time
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -37,10 +45,24 @@ TAIL_CUT = 80         # 单条事件文本截断长度（字符）
 RECENT_WINDOW = 3600  # 最近任务窗口（秒）：只展示 1 小时内有写入的任务
 MAX_TASKS = 8         # 任务卡片上限（按 mtime 降序取前 8 个）
 RUNNING_AGE = 30      # 文件 mtime 距今 ≤ 30s 视为 running，否则 completed
+TIMELINE_MAX = 50     # 任务详情时间线条数上限（最多 50 条，取最近）
+
+# DeepSeek 官方定价（元/百万 tokens），deepseek-chat（V3）2025-02 起生效：
+#   输入（缓存未命中）¥2、输出 ¥8、缓存命中 ¥0.5；deepseek-reasoner 为 4/16/1。
+#   本机会话模型为 deepseek-v4-flash，按 deepseek-chat 价近似估算。
+#   价格可改：修改本常量后重启看板即生效（成本为估算值，字段名 cost_est 标注）。
+PRICES = {"input": 2.0, "output": 8.0, "cache_read": 0.5}
 
 # —— 共享状态：后台轮询线程写入，HTTP 线程只读（_LOCK 保护）——
 _LOCK = threading.Lock()
 _STATE = {"tasks": []}   # 最近任务列表快照（scan_tasks 的结果）
+
+# —— 飞书完成通知状态（_NOTIFIED_LOCK 保护，轮询线程写 + 测试并发读）——
+_FEISHU_WEBHOOK = None   # 飞书群机器人 webhook URL（--feishu-webhook / 环境变量 FEISHU_WEBHOOK）
+_FEISHU_ENABLED = False  # 是否启用通知（有 webhook 且未 --no-feishu）
+_NOTIFIED_IDS = set()    # 已通知过的完整会话 id（同一会话只通知一次）
+_PREV_STATUS = {}        # {完整会话 id: 上次扫描 status}，用于检测 running→completed 翻转
+_NOTIFIED_LOCK = threading.Lock()
 
 # —— 解析缓存：{会话文件路径: (mtime, 解析结果 dict)}；文件 mtime 未变直接复用，
 #    避免 4s 轮询对未变化（尤其已完成）的会话文件反复全量解压（_PARSE_CACHE_LOCK
@@ -89,8 +111,9 @@ def _meta_from_lines(lines):
     """从事件行解析会话元信息（type=session 事件，字段在事件顶层）。
 
     tag 取会话 id 去掉 "session-" 前缀后的前 8 位（如 27885bb9）；
-    task 用事件里的 cwd（比编码目录名更完整）；started_at 用 createdAt(ms)。
-    返回 {"tag": ..., "task": ..., "started_at": epoch 秒或 None}。
+    task 用事件里的 cwd（比编码目录名更完整）；started_at 用 createdAt(ms)；
+    sid 为完整会话 id（供飞书通知去重的私有键，不对外暴露）。
+    返回 {"tag": ..., "task": ..., "started_at": epoch 秒或 None, "sid": ...}。
     """
     for ln in lines:
         try:
@@ -104,8 +127,9 @@ def _meta_from_lines(lines):
             started = None
             if isinstance(created_ms, (int, float)) and created_ms > 0:
                 started = created_ms / 1000.0
-            return {"tag": tag, "task": ev.get("cwd"), "started_at": started}
-    return {"tag": None, "task": None, "started_at": None}
+            return {"tag": tag, "task": ev.get("cwd"),
+                    "started_at": started, "sid": sid or None}
+    return {"tag": None, "task": None, "started_at": None, "sid": None}
 
 
 def _message_text(data):
@@ -128,6 +152,108 @@ def _message_text(data):
     return " ".join(parts).strip()
 
 
+def scan_usage(events):
+    """探测并累计事件流里的 token usage → 成本估算输入；无 usage 返回 None。
+
+    实测（2026-08-15 本机真实会话）：usage 位于 assistant/message 事件的
+    data.usage，键为 inputTokens/outputTokens/cacheReadTokens/reasoningTokens
+    （camelCase）；兼容 tool/result 与 snake_case（prompt_tokens/completion_tokens）。
+    返回 {"input_tokens": int, "output_tokens": int, "cache_read_tokens": int}；
+    事件流无任何 usage 数据 → None（cost_est 置 None，前端不显示，禁止硬编假数据）。
+    """
+    total_in = total_out = total_cache = 0
+    found = False
+    for typ, data in events:
+        if typ not in ("assistant/message", "tool/result") \
+                or not isinstance(data, dict):
+            continue
+        u = data.get("usage")
+        if not isinstance(u, dict):
+            continue
+        tin = u.get("inputTokens", u.get("prompt_tokens", 0))
+        tout = u.get("outputTokens", u.get("completion_tokens", 0))
+        tc = u.get("cacheReadTokens", 0)
+        if not isinstance(tin, (int, float)) or not isinstance(tout, (int, float)):
+            continue  # usage 字段格式不符 → 跳过该事件（不当作有效 usage）
+        total_in += int(tin or 0)
+        total_out += int(tout or 0)
+        if isinstance(tc, (int, float)):
+            total_cache += int(tc or 0)
+        found = True
+    if not found:
+        return None
+    return {"input_tokens": total_in, "output_tokens": total_out,
+            "cache_read_tokens": total_cache}
+
+
+def estimate_cost(usage):
+    """按 DeepSeek 定价常量把 usage 估算为成本（元）；usage 为 None → None。
+
+    公式：input×输入价 + output×输出价 + cache_read×缓存价，除以 1e6
+    （PRICES 单位为元/百万 tokens）。返回浮点元，展示侧格式化为「≈¥0.0123」；
+    无 usage → None（前端不显示成本行）。
+    """
+    if not usage:
+        return None
+    yuan = (usage.get("input_tokens", 0) * PRICES["input"]
+            + usage.get("output_tokens", 0) * PRICES["output"]
+            + usage.get("cache_read_tokens", 0) * PRICES.get("cache_read", 0.0))
+    return yuan / 1_000_000.0
+
+
+def _task_title(events, cwd):
+    """任务标题：优先 session/title 事件的 data.title（取最后一个非空）。
+
+    实测本机会话会有多个 session/title 事件（先 fallback 摘要、后 provider
+    生成版，后者更完整）→ 取最后一个非空值；无标题回退 cwd 的 basename，
+    再回退完整 cwd；都无 → None。
+    """
+    title = None
+    for typ, data in events:
+        if typ == "session/title" and isinstance(data, dict):
+            t = data.get("title")
+            if isinstance(t, str) and t.strip():
+                title = t.strip()
+    if title:
+        return title
+    if cwd:
+        base = os.path.basename(cwd.rstrip("\\/"))
+        return base or cwd
+    return None
+
+
+def _tool_call_detail(data):
+    """tool/call 的 data → 工具名 + 参数摘要文本（如「bash: pytest -q」）。
+
+    bash 取命令原文；read/write 取 file_path；其他取 arguments JSON 摘要。
+    供 format_tail_line / _timeline_desc 复用（参数解析逻辑只写一份）。
+    """
+    name = data.get("name") or ""
+    args = data.get("arguments")
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            if isinstance(parsed, dict):
+                args = parsed
+        except (json.JSONDecodeError, ValueError):
+            pass  # arguments 不是 JSON → 按原样处理
+    detail = ""
+    if name == "bash":
+        if isinstance(args, dict):
+            detail = args.get("command") or args.get("cmd") or ""
+        elif isinstance(args, str):
+            detail = args
+    elif name in ("read", "write"):
+        if isinstance(args, dict) and args.get("file_path"):
+            detail = str(args["file_path"])
+    else:
+        if isinstance(args, dict):
+            detail = json.dumps(args, ensure_ascii=False)
+        elif args:
+            detail = str(args)
+    return f"{name}: {detail}"
+
+
 def format_tail_line(ev, todo_count=0):
     """单个事件 → 紧凑单行文本（事件类型 + 关键内容，截断 TAIL_CUT 字符）。
 
@@ -139,30 +265,7 @@ def format_tail_line(ev, todo_count=0):
     typ, data = ev
     text = typ
     if typ == "tool/call" and isinstance(data, dict):
-        name = data.get("name") or ""
-        args = data.get("arguments")
-        if isinstance(args, str):
-            try:
-                parsed = json.loads(args)
-                if isinstance(parsed, dict):
-                    args = parsed
-            except (json.JSONDecodeError, ValueError):
-                pass  # arguments 不是 JSON → 按原样处理
-        detail = ""
-        if name == "bash":
-            if isinstance(args, dict):
-                detail = args.get("command") or args.get("cmd") or ""
-            elif isinstance(args, str):
-                detail = args
-        elif name in ("read", "write"):
-            if isinstance(args, dict) and args.get("file_path"):
-                detail = str(args["file_path"])
-        else:
-            if isinstance(args, dict):
-                detail = json.dumps(args, ensure_ascii=False)
-            elif args:
-                detail = str(args)
-        text = f"tool/call {name}: {detail}"  # 突出动作：工具名 + 参数摘要
+        text = f"tool/call {_tool_call_detail(data)}"  # 突出动作：工具名 + 参数摘要
     elif typ == "assistant/message" and isinstance(data, dict):
         text = f"assistant/message: {_message_text(data)}"
     elif typ == "todo/write" and isinstance(data, dict):
@@ -232,6 +335,67 @@ def format_tail(events, times=None, max_lines=TAIL_LINES):
         merged.append((_ts_text(i, times), format_tail_line(ev, todo_count)))
         i += 1
     return [ts + " " + text for ts, text in merged[-max_lines:]]
+
+
+def _timeline_desc(ev, todo_count):
+    """单个事件 → 时间线描述文本（不含类型前缀；type 字段单独列在条目里）。
+
+    与 format_tail_line 同规则，但去掉「tool/call」「assistant/message」等
+    类型前缀，避免时间线条目里类型重复显示。
+    """
+    typ, data = ev
+    if typ == "tool/call" and isinstance(data, dict):
+        return _tool_call_detail(data)
+    if typ == "assistant/message" and isinstance(data, dict):
+        return _message_text(data)
+    if typ == "todo/write" and isinstance(data, dict):
+        items = data.get("todos") or data.get("items") or []
+        if isinstance(items, list) and items:
+            idx, total = sp._pick_todo_stage(items, todo_count)
+            return f"当前第 {idx} 项/共 {total} 项"
+        return ""
+    if typ == "step/start" and isinstance(data, dict):
+        return f"步骤{data.get('step', '')}"
+    if typ == "session/title" and isinstance(data, dict):
+        return str(data.get("title") or "")
+    return ""
+
+
+def build_timeline(events, times=None, max_items=TIMELINE_MAX):
+    """事件流 → 任务详情时间线摘要列表（[{t, type, desc}]，最多 max_items 条）。
+
+    与 format_tail 同规则（连续同类 chunk 合并 ×N / todo 进度 / tool 摘要），
+    但保留结构化字段供前端渲染：t 为 HH:MM:SS（无 time 用文件事件顺序序号），
+    type 为事件类型，desc 为不含类型前缀的简短描述。取**最近** max_items 条
+    （时间线随任务推进滚动，上限 50 条防页面过载）。
+    """
+    if max_items <= 0:
+        return []
+    items = []
+    todo_count = 0
+    i, n = 0, len(events)
+    while i < n:
+        ev = events[i]
+        typ = ev[0] if isinstance(ev, (tuple, list)) and ev else None
+        ts = _ts_text(i, times)
+        t = ts[1:-1] if len(ts) >= 3 and ts[0] == "[" and ts[-1] == "]" else ts
+        if typ in _CHUNK_TYPES:
+            # 连续相同 chunk 的运行长度 → 合并为 1 条（与 format_tail 一致）
+            j = i
+            while j < n and isinstance(events[j], (tuple, list)) \
+                    and events[j][0] == typ:
+                j += 1
+            count = j - i
+            items.append({"t": t, "type": typ,
+                          "desc": f"×{count}" if count > 1 else ""})
+            i = j
+            continue
+        if typ == "todo/write":
+            todo_count += 1
+        items.append({"t": t, "type": typ,
+                      "desc": _timeline_desc(ev, todo_count)})
+        i += 1
+    return items[-max_items:]
 
 
 def _read_task(path):
@@ -321,9 +485,10 @@ def _parse_task(path):
     """单个会话文件 → 解析结果 dict（不含依赖 now 的 status/elapsed_s/eta_at）。
 
     复用现有解析函数：_meta_from_lines（id/cwd）、sp.build_progress（阶段/动作）、
-    blend_eta（ETA）、format_tail_line（事件流紧凑文本）；解析失败返回 None
-    （静默跳过，不崩溃）。结果带私有键 _started_at（供 _build_task 刷新
-    elapsed_s），对外字段与旧 _build_task 输出一致。
+    blend_eta（ETA）、format_tail_line（事件流紧凑文本）、scan_usage（成本）、
+    build_timeline（详情时间线）；解析失败返回 None（静默跳过，不崩溃）。
+    结果带私有键 _started_at（供 _build_task 刷新 elapsed_s）与 _sid（供飞书
+    通知去重，live_payload 剔除），对外字段与旧 _build_task 输出一致。
     """
     try:
         lines, events, times, started_at = _read_task(path)
@@ -338,6 +503,7 @@ def _parse_task(path):
         return {
             "id": meta["tag"],
             "cwd": cwd,
+            "title": _task_title(events, cwd),  # 任务标题（session/title 优先）
             "stage": prog.get("stage"),
             "stage_idx": k,
             "stage_total": n,
@@ -346,8 +512,11 @@ def _parse_task(path):
             "eta_s": eta_s,
             "eta_mode": eta_mode,
             "eta_at": eta_at,
+            "cost_est": estimate_cost(scan_usage(events)),  # 成本估算（无 usage → None）
+            "timeline": build_timeline(events, times),      # 详情时间线（最多 50 条）
             "tail": format_tail(events, times, TAIL_LINES),
             "_started_at": started_at,  # 私有键：仅供 elapsed_s 刷新，不对外
+            "_sid": meta["sid"],        # 私有键：仅供飞书通知去重，不对外
         }
     except Exception:
         return None  # 单个任务解析失败静默跳过
@@ -576,14 +745,103 @@ def blend_eta(state, hist_s):
     return (None, "none")
 
 
+def _feishu_post(url, text):
+    """向飞书群机器人 webhook POST 一条文本消息（失败静默，不抛异常）。
+
+    格式：{"msg_type": "text", "content": {"text": "..."}}（飞书官方格式）。
+    这是本工具唯一的网络调用：仅任务翻转时触发，超时 5s，任何失败静默
+    （不阻塞看板轮询线程）。
+    """
+    try:
+        body = json.dumps({"msg_type": "text",
+                           "content": {"text": text}}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+    except Exception:
+        pass  # 发送失败静默（不阻塞看板）
+
+
+def _fmt_mmss(seconds):
+    """秒 → mm:ss 文本（耗时展示，如 12:34；≥1 小时显示 h:mm:ss）。"""
+    s = max(0, int(seconds or 0))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def _send_feishu_notify(task):
+    """组装完成通知文本并发送（标题/cwd/耗时 mm:ss/最后阶段）。
+
+    文案：「✅ dsh 任务完成：<标题>（<cwd>）· 耗时 <mm:ss> · 阶段 <最后阶段>」；
+    标题/阶段截断到合理长度，避免飞书消息过长。
+    """
+    title = (task.get("title") or task.get("cwd") or "未知任务")[:60]
+    cwd = task.get("cwd") or "未知目录"
+    stage = task.get("stage") or (
+        f"步骤{task.get('stage_idx')}" if task.get("stage_idx") else "未知")
+    text = (f"✅ dsh 任务完成：{title}（{cwd}）· "
+            f"耗时 {_fmt_mmss(task.get('elapsed_s'))} · 阶段 {str(stage)[:30]}")
+    _feishu_post(_FEISHU_WEBHOOK, text)
+
+
+def _check_flips(tasks):
+    """检测 running→completed 翻转 → 触发飞书完成通知（去重 + 静默失败）。
+
+    规则（按 spec）：
+      - 只看「上次扫描 running → 本次扫描 completed」的任务；首次扫描无上次
+        状态 → **启动时已存在的 completed 任务天然不通知**；
+      - 同一会话只通知一次（_NOTIFIED_IDS 缓存完整会话 id，先标记再发送，
+        发送失败也不重试 → 保证不重复刷屏）；
+      - 未启用（--no-feishu / 无 webhook）→ 只维护状态不发送；
+      - 发送失败由 _feishu_post 内部静默（不阻塞看板）。
+    状态表 _PREV_STATUS / _NOTIFIED_IDS 受 _NOTIFIED_LOCK 保护（线程安全）。
+    """
+    with _NOTIFIED_LOCK:
+        current = {t["_sid"]: t for t in tasks if t.get("_sid")}
+        for sid, task in current.items():
+            if (_PREV_STATUS.get(sid) == "running"
+                    and task["status"] == "completed"
+                    and sid not in _NOTIFIED_IDS):
+                _NOTIFIED_IDS.add(sid)  # 先标记：同一会话只通知一次
+                if _FEISHU_ENABLED and _FEISHU_WEBHOOK:
+                    _send_feishu_notify(task)
+        _PREV_STATUS.clear()
+        _PREV_STATUS.update({sid: t["status"] for sid, t in current.items()})
+
+
+def status_text(tasks):
+    """任务状态表文本（CLI --status 用）：状态/标题/阶段 k/N/ETA/成本。
+
+    无任务 → 「暂无任务」（exit 0，不启动服务器）。
+    """
+    if not tasks:
+        return "暂无任务"
+    lines = ["{:<9}{:<42}{:<12}{:<10}{}".format("状态", "标题", "阶段", "ETA", "成本")]
+    for t in tasks:
+        status = "running" if t.get("status") == "running" else "completed"
+        title = ((t.get("title") or "")[:40] or "-")
+        k, n = t.get("stage_idx") or 0, t.get("stage_total") or 0
+        stage = f"{k}/{n}" if n else (str(k) if k else "-")
+        eta = t.get("eta_at") or "-"
+        cost = f"≈¥{t['cost_est']:.4f}" if t.get("cost_est") is not None else "-"
+        lines.append("{:<9}{:<42}{:<12}{:<10}{}".format(
+            status, title, stage, eta, cost))
+    return "\n".join(lines)
+
+
 def poll_once():
-    """单次轮询：全库扫描最近任务 → 更新共享状态。任何异常静默。"""
+    """单次轮询：全库扫描最近任务 → 更新共享状态 + 飞书翻转检测。任何异常静默。"""
     try:
         tasks = scan_tasks()
         with _LOCK:
             _STATE["tasks"] = tasks
+        _check_flips(tasks)
     except Exception:
-        pass  # 扫描/解析失败全部静默，绝不崩溃
+        pass  # 扫描/解析/通知失败全部静默，绝不崩溃
 
 
 def poll_loop():
@@ -601,9 +859,12 @@ def live_payload():
 
     兼容说明：原单任务顶层字段（running/tag/task/...）不再返回，
     前端已同步改为 {"tasks": [...]}；无任务时 tasks=[]。
+    私有键 _sid（完整会话 id，仅供飞书通知去重）在此剔除，不对外暴露。
     """
     with _LOCK:
-        tasks = list(_STATE["tasks"])
+        tasks = [dict(t) for t in _STATE["tasks"]]
+    for t in tasks:
+        t.pop("_sid", None)
     return {"tasks": tasks}
 
 
@@ -645,7 +906,10 @@ def build_parser():
     """命令行参数解析器（argparse）。
 
     位置参数 port 兼容旧的 `python dashboard.py 8123` 用法（缺省 8123）；
-    --no-open 关闭启动后自动打开浏览器的行为。
+    --no-open 关闭启动后自动打开浏览器的行为；
+    --status 不启动服务器，直接打印当前任务状态表后退出（exit 0）；
+    --feishu-webhook / 环境变量 FEISHU_WEBHOOK 配置飞书完成通知
+    （任务 running→completed 翻转时 POST 一条文本消息）；--no-feishu 强制关闭。
     """
     parser = argparse.ArgumentParser(
         description="dsh 进度可视化看板服务器（纯本地）")
@@ -653,6 +917,12 @@ def build_parser():
                         help="监听端口（默认 8123；被占用时自动 +1 递增，最多 5 次）")
     parser.add_argument("--no-open", action="store_true",
                         help="启动后不自动打开浏览器（默认自动打开）")
+    parser.add_argument("--status", action="store_true",
+                        help="不启动服务器：打印当前任务状态表（状态/标题/阶段/ETA/成本）后退出")
+    parser.add_argument("--feishu-webhook", default=None,
+                        help="飞书群机器人 webhook URL（任务完成时通知；也可用环境变量 FEISHU_WEBHOOK）")
+    parser.add_argument("--no-feishu", action="store_true",
+                        help="关闭飞书完成通知（即使配置了 webhook）")
     return parser
 
 
@@ -683,6 +953,15 @@ def pick_free_port(start, tries=5):
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
+    if args.status:
+        # --status：不启动服务器，直接打印当前任务状态表（exit 0）
+        print(status_text(scan_tasks()))
+        raise SystemExit(0)
+    # 飞书配置：命令行参数优先，其次环境变量 FEISHU_WEBHOOK；--no-feishu 强制关闭
+    _FEISHU_WEBHOOK = args.feishu_webhook or os.environ.get("FEISHU_WEBHOOK") or ""
+    _FEISHU_ENABLED = bool(_FEISHU_WEBHOOK) and not args.no_feishu
+    if _FEISHU_ENABLED:
+        print(f"飞书完成通知已启用: {_FEISHU_WEBHOOK[:48]}...", flush=True)
     port = pick_free_port(args.port)  # 端口冲突自动递增（最多 5 次）
     threading.Thread(target=poll_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)

@@ -28,6 +28,7 @@
   .eta { font-size: 13px; color: #fbbf24; font-weight: bold; }
   .eta-muted { color: #8b93a7; font-size: 12px; font-weight: normal; }
   .action { margin-top: 6px; font-size: 13px; }
+  .cost { color: #fbbf24; font-weight: bold; font-size: 13px; }  /* 成本估算值（黄色高亮） */
   .tail-btn { margin-top: 8px; cursor: pointer; color: #60a5fa; font-size: 13px; user-select: none; }
   .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; margin-top: 6px; }
   .pre.collapse { display: none; }        /* 已完成卡片：事件流默认折叠 */
@@ -37,6 +38,7 @@
   .tl-tool { color: #93c5fd; }   /* tool/call 动作高亮（蓝） */
   .tl-todo { color: #fbbf24; }   /* todo/write 进度高亮（黄） */
   .tl-chunk { color: #5b6472; }  /* 合并后的 reasoning-chunks ×N 等（灰，弱化刷屏项） */
+  .tl-type { color: #8b93a7; }   /* 时间线条目的事件类型（灰） */
 </style>
 </head>
 <body>
@@ -76,6 +78,23 @@ function tailHtml(t) {
     return '<div class="tl' + cls + '">' + esc(ln) + '</div>';
   }).join('');
 }
+// 详情时间线渲染：结构化 [{t, type, desc}]，每条一行（等宽字体由 .pre 保证），
+// 时间戳 + 事件类型（灰）+ 描述（tool 蓝 / todo 黄 高亮）
+function timelineHtml(t) {
+  const items = t.timeline || [];
+  if (!items.length) return '(暂无详情...)';
+  return items.map(it => {
+    const ty = esc(it.type || '');
+    const ds = esc(it.desc || '');
+    const ttag = esc(it.t || '');
+    let cls = '';
+    if (ty === 'tool/call') cls = ' tl-tool';
+    else if (ty === 'todo/write') cls = ' tl-todo';
+    else if (ty === 'reasoning-chunks' || ty === 'tool-call-chunks' || ty === 'assistant-chunks') cls = ' tl-chunk';
+    return '<div class="tl"><span class="tl-type">[' + ttag + ']</span> <span class="tl-type">' + ty + '</span>' +
+      (ds ? '<span class="' + cls + '"> · ' + ds + '</span>' : '') + '</div>';
+  }).join('');
+}
 // 单个任务卡片（i 用于生成事件流元素的唯一 id）
 function cardHtml(t, i) {
   const running = t.status === 'running';
@@ -87,7 +106,16 @@ function cardHtml(t, i) {
   let html = '<div class="card ' + (running ? 'card-running' : 'card-completed') + '">';
   html += '<div><span class="status-dot ' + dot + '"></span><span class="' + cls + '">' + label + '</span>' + id +
     '<span class="muted">' + (running ? '已运行 ' : '耗时 ') + fmtDur(t.elapsed_s) + '</span></div>';
-  html += '<div class="card-title">' + esc(t.cwd || '(未知目录)') + '</div>';
+  // 任务标题优先（session/title 事件），cwd 作为次级路径行展示
+  html += '<div class="card-title">' + esc(t.title || t.cwd || '(未知任务)') + '</div>';
+  if (t.title) {
+    html += '<div class="muted" style="font-size:11px;margin-top:2px;word-break:break-all;">' + esc(t.cwd || '') + '</div>';
+  }
+  // 成本行：仅当 cost_est 有值才显示（估算值，无 usage 数据时后端置 None）
+  if (typeof t.cost_est === 'number' && t.cost_est !== null) {
+    html += '<div style="margin-top:6px;"><span class="muted">成本:</span> <span class="cost">≈¥' +
+      t.cost_est.toFixed(4) + '</span> <span class="muted">（估算）</span></div>';
+  }
   if (running) {
     // 运行中卡片：阶段进度条
     if (t.stage_idx && t.stage_total) {
@@ -106,6 +134,10 @@ function cardHtml(t, i) {
     if (t.action) {
       html += '<div class="action"><span class="muted">最近动作:</span> ' + esc(t.action) + '</div>';
     }
+    // 运行中卡片：详情时间线（默认折叠，点击展开完整 timeline，等宽字体）
+    const tlid = 'tl-' + i;
+    html += '<div class="tail-btn" onclick="toggleTail(\'' + tlid + '\')" id="' + tlid + '-btn">📋 详情（点击展开）</div>';
+    html += '<div class="pre collapse" id="' + tlid + '">' + timelineHtml(t) + '</div>';
     // 运行中卡片：事件流默认展开（max-height 滚动）
     html += '<div class="pre">' + tailHtml(t) + '</div>';
   } else {
@@ -121,12 +153,13 @@ function cardHtml(t, i) {
   html += '</div>';
   return html;
 }
-// 已完成卡片：点击切换事件流展开/折叠
+// 折叠区切换（事件流 / 详情时间线通用）：id 前缀 tl- 为详情，其余为事件流
 function toggleTail(id) {
   const el = document.getElementById(id);
   const btn = document.getElementById(id + '-btn');
   const open = el.classList.toggle('open');
-  btn.textContent = open ? '📜 事件流（点击折叠）' : '📜 事件流（点击展开）';
+  const label = id.indexOf('tl-') === 0 ? '📋 详情' : '📜 事件流';
+  btn.textContent = open ? (label + '（点击折叠）') : (label + '（点击展开）');
 }
 async function load() {
   try {
@@ -140,7 +173,7 @@ async function load() {
       // 空状态：无任务
       grid.innerHTML = '<div class="card"><span class="status-dot dot-done"></span> 等待 dsh 任务开始...' +
         '<div class="muted" style="margin-top:8px;">未在最近 1 小时内发现 ~/.dsh/sessions 下的会话，' +
-        '启动一个 dsh headless 任务后，这里会自动显示多任务分栏（阶段 / ETA / 事件流）。</div></div>';
+        '启动一个 dsh headless 任务后，这里会自动显示多任务分栏（阶段 / ETA / 标题 / 成本估算 / 详情时间线）。</div></div>';
       return;
     }
     grid.innerHTML = tasks.map(cardHtml).join('');
