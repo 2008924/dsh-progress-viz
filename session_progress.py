@@ -172,7 +172,7 @@ def format_action(tool_call):
         fp = args.get("file_path") if isinstance(args, dict) else None
         if fp:
             verb = "读取文件" if name == "read" else "写入文件"
-            return f"{verb}: {os.path.basename(str(fp))}"
+            return f"{verb}: {os.path.basename(str(fp).replace(chr(92), chr(47)))}"
         return name
     return name
 
