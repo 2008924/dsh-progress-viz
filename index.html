@@ -59,7 +59,10 @@ async function load() {
       }
       // ETA
       if (live.eta_at) {
-        const modeTxt = live.eta_mode === 'linear' ? '按阶段速度推算' : '';
+        const modeTxt = live.eta_mode === 'linear' ? '按阶段速度推算'
+          : live.eta_mode === 'blend' ? '按阶段速度+历史均值融合推算'
+          : live.eta_mode === 'history' ? '按历史会话均值推算'
+          : '';
         html += '<div style="margin-top:6px;"><span class="eta">⏱ 预计完成 ' + live.eta_at +
           ' <span class="eta-muted">(剩余 ' + fmtDur(live.eta_s) + (modeTxt ? ' · ' + modeTxt : '') + ')</span></span></div>';
       }

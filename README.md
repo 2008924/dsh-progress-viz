@@ -59,13 +59,23 @@ python dashboard.py 8123
   （开始标记 in_progress、完成标记 completed，清单变化时更新）。
   ```
 
-- **ETA** 为**阶段线性外推**：已走过阶段的平均耗时 × 剩余阶段数（无历史均值兜底）。数据不足（阶段数 < 2 或剩余为 0）时 `eta_mode` 为 `none`，不显示 ETA。
+- **ETA** 为**线性外推 + 历史均值融合**：
+  - **线性分量 linear_s**：已走过阶段的平均耗时 × 剩余阶段数；
+  - **历史分量 hist_s**：同 cwd 目录下**历史会话**（排除当前监控会话）耗时的**中位数**
+    （每个历史会话耗时 = 事件流最大 `time` − 最小 `time`；无历史/扫描失败时视为不可用）；
+  - **融合公式**：`eta = α·linear_s + (1−α)·hist_s`，α 随阶段进度自适应：
+    `k≥3 → α=0.7`，`k==2 → α=0.5`，`k<2 → α=0`（纯历史均值）；
+  - **回退链**（`eta_mode` 标记）：有阶段信息（k≥2 且 n>k）且历史可用 → `blend`；
+    有阶段但无历史 → 纯 `linear`（α=1）；无阶段但有历史 → 纯 `history`（α=0）；都无 → `none`（不显示 ETA）；
+  - 历史会话每次全量扫描（会话数少，代价可接受），结果按会话目录 mtime 缓存，
+    4 秒轮询时 mtime 未变化直接复用 hist_s。
 
 ## 测试
 
 ```bash
 python tests\make_fixtures.py          # 生成合成 fixtures（无真实会话数据）
 python tests\test_session_progress.py  # 跑全部单测（无需 pytest），exit 0 全过
+python tests\test_eta_blend.py         # ETA 融合算法单测（历史会话 fixture 生成到临时目录）
 ```
 
 ## 文件结构
@@ -76,8 +86,9 @@ dsh-progress-viz/
 ├── session_progress.py   # 会话事件流 → 阶段解析器（纯本地）
 ├── index.html            # 看板页面（深色主题，5s 自动刷新）
 ├── tests/
-│   ├── make_fixtures.py              # 合成 fixtures 生成器
+│   ├── make_fixtures.py              # 合成 fixtures 生成器（含历史会话 fixture）
 │   ├── test_session_progress.py      # 单测（无需 pytest）
+│   ├── test_eta_blend.py             # ETA 融合算法单测
 │   └── fixtures/session-synthetic.jsonl.zstd
 ├── README.md
 ├── LICENSE

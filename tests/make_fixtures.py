@@ -11,10 +11,13 @@
 """
 import json
 import os
+import sys
 
 import zstandard
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))  # 使同级 session_progress.py 可导入（encode_cwd）
+import session_progress as _sp
 FIX_DIR = os.path.join(HERE, "fixtures")
 FIX = os.path.join(FIX_DIR, "session-synthetic.jsonl.zstd")
 
@@ -131,6 +134,45 @@ def write_fixture(path=FIX, events=None):
             frame = cctx.compress("".join(lines[i:i + FRAME_LINES]).encode("utf-8"))
             f.write(frame)  # 追加写入下一个 frame
     return path
+
+
+def generate_hist_session(duration_s, start_ms=None, sid=None):
+    """生成一个历史会话的事件列表（session + step/start×3）。
+
+    事件 time 跨度（首尾差）恰好 = duration_s 秒（毫秒时间戳），
+    用于 ETA 融合的 hist_s（同目录历史会话耗时中位数）测试。
+    """
+    if start_ms is None:
+        start_ms = CREATED_MS - 3600000  # 默认早于当前会话 1 小时
+    if sid is None:
+        sid = "session-hist-%d" % start_ms
+    dur_ms = int(duration_s * 1000)
+    events = [{"type": "session", "version": 0, "id": sid,
+               "createdAt": start_ms, "cwd": CWD, "delegationDepth": 0,
+               "time": start_ms}]
+    n = 4  # session + 3 个 step/start
+    for i in range(1, n):
+        t = start_ms + dur_ms * i // (n - 1)  # 末事件 time = start + duration_s*1000
+        events.append({"type": "step/start", "seq": i, "time": t,
+                       "data": {"turn": 1, "step": i}})
+    return events
+
+
+def write_hist_fixtures(root, cwd=CWD, durations=(60, 120)):
+    """在 root 下生成多个历史会话 fixture（模拟 ~/.dsh/sessions 目录结构）。
+
+    每个历史会话写到 <root>/<cwd编码>/<session-id>/session.jsonl.zstd，
+    事件 time 跨度分别为 durations（秒）。返回生成的会话文件路径列表。
+    """
+    cwd_dir = os.path.join(root, _sp.encode_cwd(cwd))
+    paths = []
+    for i, dur in enumerate(durations):
+        sid = "session-hist-%04d" % i
+        events = generate_hist_session(dur, sid=sid)
+        path = os.path.join(cwd_dir, sid, "session.jsonl.zstd")
+        write_fixture(path, events)
+        paths.append(path)
+    return paths
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@
 不依赖 dsh_dispatch.py / running.json：直接监控 ~/.dsh/sessions 下**所有**
 cwd 编码目录，取全库最新 mtime 的 session.jsonl.zstd 作为"当前任务"，
 每 4 秒增量解析会话事件流，实时呈现阶段 / ETA / 最近动作 / 事件流。
+ETA 为「阶段线性外推 + 同目录历史会话耗时中位数」加权融合（详见
+compute_hist_s / blend_eta）。
 
 用法: python dashboard.py [port]   (默认 8123)
   浏览器打开 http://127.0.0.1:8123
@@ -40,7 +42,7 @@ _STATE = {
     "events": [],          # 累积解析事件（封顶 _MAX_EVENTS）
     "stage": None, "stage_idx": 0, "stage_total": 0, "stage_pct": 0,
     "action": None,        # 最近工具动作摘要
-    "stage_marks": [],     # 阶段变化时间戳（ETA 线性外推：marks[0]=任务起点）
+    "stage_marks": [],     # 阶段变化时间戳（ETA：marks[0]=任务起点，线性外推+历史均值融合）
     "eta_s": None, "eta_mode": "none", "eta_at": None,
     "tail": [],            # 最近 ~15 条事件的紧凑文本行（实时动态流）
 }
@@ -167,13 +169,114 @@ def format_tail_line(ev):
     return text[:TAIL_CUT]
 
 
-def compute_eta(state):
-    """ETA 线性外推：已走过阶段均速 × 剩余阶段数（无历史均值兜底）。
+# —— ETA 历史会话缓存：{会话目录: (目录 mtime, hist_s)}，mtime 未变时复用 ——
+_HIST_CACHE = {}
 
-    借鉴 dsh_dispatch.compute_eta 的线性外推逻辑独立实现：marks[0] 是任务
-    起点（session createdAt），此后每次阶段变化追加一个时间戳；已走过阶段数
-    = stage_idx - 1，均速 = (最后 mark - 起点) / 已走过阶段数。
-    返回 (eta_s, mode)：mode 为 'linear' 或 'none'（数据不足时无 ETA）。
+
+def _median(values):
+    """中位数：奇数个取中间值，偶数个取中间两值平均；空列表返回 0。"""
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0
+    mid = n // 2
+    return s[mid] if n % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _session_duration(path):
+    """单个会话文件的耗时（秒）：事件流最大 time − 最小 time（毫秒 → 秒）。
+
+    事件行顶层有 "time"（毫秒时间戳）；session 事件无 time 时用 createdAt 兜底。
+    解析失败 / 无有效时间 → 返回 None（静默，不抛异常）。
+    """
+    try:
+        lines, _ = sp.tail_session(path, 0)
+    except Exception:
+        return None
+    times = []
+    for ln in lines:
+        try:
+            ev = json.loads(ln)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(ev, dict):
+            continue
+        t = ev.get("time")
+        if isinstance(t, (int, float)) and t > 0:
+            times.append(t)
+        elif ev.get("type") == "session":
+            ct = ev.get("createdAt")  # 首行 session 事件无 time 时的兜底
+            if isinstance(ct, (int, float)) and ct > 0:
+                times.append(ct)
+    if not times:
+        return None
+    dur = (max(times) - min(times)) / 1000.0
+    return dur if dur > 0 else None
+
+
+def compute_hist_s(cwd, exclude_session):
+    """同 cwd 目录下历史会话耗时的中位数（秒），排除当前监控会话。
+
+    布局：<SESSIONS_ROOT>/<cwd编码>/<session-id>/session.jsonl.zstd
+    （兼容直接平铺在编码目录下的 .zstd）；每个历史会话耗时 = 事件流
+    最大 time − 最小 time（_session_duration）。取所有历史会话耗时的
+    **中位数**（比均值抗异常值）作为 hist_s。
+    扫描失败 / 无历史会话 / cwd 缺失 → 返回 0（静默，不崩溃）。
+    结果缓存：会话目录 mtime 无变化时直接复用 hist_s（4s 轮询不重复解压）。
+    """
+    try:
+        if cwd:
+            cwd_dir = os.path.join(sp.SESSIONS_ROOT, sp.encode_cwd(cwd))
+        elif exclude_session:
+            # cwd 缺失时从当前会话路径反推：<root>/<cwd编码>/<session-id>/session.jsonl.zstd
+            cwd_dir = os.path.dirname(os.path.dirname(exclude_session))
+        else:
+            return 0
+        if not os.path.isdir(cwd_dir):
+            return 0
+        try:
+            dir_mtime = os.path.getmtime(cwd_dir)
+        except OSError:
+            dir_mtime = 0
+        cached = _HIST_CACHE.get(cwd_dir)
+        if cached is not None and cached[0] == dir_mtime:
+            return cached[1]  # 目录 mtime 未变 → 复用缓存 hist_s
+        durations = []
+        try:
+            names = os.listdir(cwd_dir)
+        except OSError:
+            names = []
+        for name in names:
+            p = os.path.join(cwd_dir, name)
+            cands = []
+            if os.path.isdir(p):
+                cands.append(os.path.join(p, "session.jsonl.zstd"))
+            elif name.endswith(".zstd"):
+                cands.append(p)  # 兼容直接平铺在编码目录下的会话文件
+            for f in cands:
+                if not os.path.isfile(f) or f == exclude_session:
+                    continue
+                dur = _session_duration(f)
+                if dur:
+                    durations.append(dur)
+        hist_s = _median(durations) if durations else 0
+        _HIST_CACHE[cwd_dir] = (dir_mtime, hist_s)
+        return hist_s
+    except Exception:
+        return 0  # 历史会话扫描任何失败静默 → 视为无历史
+
+
+def blend_eta(state, hist_s):
+    """ETA 融合：eta = α·linear_s + (1−α)·hist_s（α 随阶段进度自适应）。
+
+    线性外推 linear_s：已走过阶段均速 × 剩余阶段数（marks[0]=任务起点，
+    此后每次阶段变化追加时间戳；与旧 compute_eta 逻辑一致）。
+    回退链（保持现有字段语义）：
+      - 有阶段信息（k≥2 且 n>k）且历史可用 → blend（k≥3 → α=0.7；k==2 → α=0.5）
+      - 有阶段信息但无历史 → 纯 linear（α=1）
+      - 无阶段信息但有历史 → 纯 history（α=0）
+      - 都无 → none
+    返回 (eta_s, mode)；hist_s 为 0 / None 视为历史不可用。
     """
     now = time.time()
     start = state.get("started_at") or now
@@ -181,12 +284,22 @@ def compute_eta(state):
     marks = state.get("stage_marks") or []
     k = state.get("stage_idx", 0)
     n = state.get("stage_total", 0)
+    has_hist = bool(hist_s)  # hist_s > 0 视为历史可用（0 = 无历史 / 扫描失败）
+    # 线性外推：已走过阶段均速 × 剩余阶段数
+    linear_s = None
     if k >= 2 and n > k and len(marks) >= 2:
-        walked = k - 1  # 已走过阶段数（从第 1 个 mark 到当前 mark 之间）
+        walked = k - 1  # 已走过阶段数（从 marks[0] 到 marks[-1] 之间）
         span = marks[-1] - marks[0] if marks[-1] > marks[0] else elapsed
         per_stage = span / walked if walked > 0 else 0
         if per_stage > 1.0:
-            return (per_stage * (n - k), "linear")
+            linear_s = per_stage * (n - k)
+    if linear_s is not None and has_hist:
+        alpha = 0.7 if k >= 3 else 0.5  # k==2 → 0.5
+        return (alpha * linear_s + (1 - alpha) * hist_s, "blend")
+    if linear_s is not None:
+        return (linear_s, "linear")
+    if has_hist:
+        return (hist_s, "history")
     return (None, "none")
 
 
@@ -202,7 +315,9 @@ def _refresh_progress(st):
     st["action"] = prog.get("action")
     n = st["stage_total"]
     st["stage_pct"] = round(st["stage_idx"] / n * 100) if n else 0
-    st["eta_s"], st["eta_mode"] = compute_eta(st)
+    # ETA 融合：线性外推 + 同目录历史会话耗时中位数加权（4s 轮询，目录 mtime 缓存）
+    hist_s = compute_hist_s(st.get("task"), st.get("path"))
+    st["eta_s"], st["eta_mode"] = blend_eta(st, hist_s)
     st["eta_at"] = (time.strftime("%H:%M:%S",
                     time.localtime(time.time() + st["eta_s"]))
                     if st["eta_s"] is not None else None)
