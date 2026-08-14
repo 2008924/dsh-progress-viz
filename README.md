@@ -1,5 +1,7 @@
 # dsh Progress Viz
 
+[![CI](https://github.com/2008924/dsh-progress-viz/actions/workflows/ci.yml/badge.svg)](https://github.com/2008924/dsh-progress-viz/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+
 实时可视化 dsh（headless 模式）任务执行过程的独立看板工具包——读取会话事件流，呈现阶段进度、ETA 与实时动态流，纯本地运行。
 
 > **English:** dsh Progress Viz is a self-contained dashboard that visualizes dsh headless task execution in real time. It parses the local session event stream (`session.jsonl.zstd`) to show stage progress, ETA and a live activity feed — 100% local, no API calls, no tokens consumed.
@@ -84,16 +86,21 @@ stage_total, stage_pct, action, eta_s, eta_mode, eta_at, elapsed_s, tail} ]}`，
 ## 测试
 
 ```bash
-python tests\make_fixtures.py          # 生成合成 fixtures（无真实会话数据）
-python tests\test_session_progress.py  # 跑全部单测（无需 pytest），exit 0 全过
-python tests\test_eta_blend.py         # ETA 融合算法单测（历史会话 fixture 生成到临时目录）
-python tests\test_multi_pane.py        # 多任务分栏单测（1 小时窗口 / mtime 排序 / status 判定）
+python tests/make_fixtures.py          # 生成合成 fixtures（无真实会话数据）
+python tests/test_session_progress.py  # 跑全部单测（无需 pytest），exit 0 全过
+python tests/test_eta_blend.py         # ETA 融合算法单测（历史会话 fixture 生成到临时目录）
+python tests/test_multi_pane.py        # 多任务分栏单测（1 小时窗口 / mtime 排序 / status 判定）
+python tests/test_tail_format.py       # tail 可读性单测（chunk 合并 / 时间戳 / 动作高亮 / 截断）
 ```
+
+GitHub Actions CI（`.github/workflows/ci.yml`）在 push 到 main 与 pull_request 时，
+以 ubuntu / macos / windows × Python 3.9 / 3.11 六种组合逐套运行上述单测。
 
 ## 文件结构
 
 ```
 dsh-progress-viz/
+├── .github/workflows/ci.yml # GitHub Actions CI（3 平台 × 2 Python 矩阵）
 ├── dashboard.py          # 独立看板服务器（全库扫描 + 4s 轮询 + 多任务分栏 + ETA）
 ├── session_progress.py   # 会话事件流 → 阶段解析器（纯本地）
 ├── index.html            # 看板页面（深色主题，多任务网格分栏，5s 自动刷新）
@@ -102,6 +109,7 @@ dsh-progress-viz/
 │   ├── test_session_progress.py      # 单测（无需 pytest）
 │   ├── test_eta_blend.py             # ETA 融合算法单测
 │   ├── test_multi_pane.py            # 多任务分栏单测
+│   ├── test_tail_format.py           # tail 可读性单测
 │   └── fixtures/session-synthetic.jsonl.zstd
 ├── README.md
 ├── LICENSE

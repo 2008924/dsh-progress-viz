@@ -117,10 +117,12 @@ def _message_text(data):
     return " ".join(parts).strip()
 
 
-def format_tail_line(ev):
+def format_tail_line(ev, todo_count=0):
     """单个事件 → 紧凑单行文本（事件类型 + 关键内容，截断 TAIL_CUT 字符）。
 
     例：「tool/call bash: pytest -q」「assistant/message: 正在分析需求」
+    「todo: 当前第 2 项/共 3 项」（todo_count = 截至当前已写过的 todo/write 次数，
+    无 status 字段的清单用「第(次数-1)项」规则，与 build_progress 一致）。
     headless 模式无 stdout，事件流就是任务的"输出"。
     """
     typ, data = ev
@@ -149,15 +151,76 @@ def format_tail_line(ev):
                 detail = json.dumps(args, ensure_ascii=False)
             elif args:
                 detail = str(args)
-        text = f"tool/call {name}: {detail}"
+        text = f"tool/call {name}: {detail}"  # 突出动作：工具名 + 参数摘要
     elif typ == "assistant/message" and isinstance(data, dict):
         text = f"assistant/message: {_message_text(data)}"
     elif typ == "todo/write" and isinstance(data, dict):
         items = data.get("todos") or data.get("items") or []
-        text = f"todo/write: 任务清单 {len(items)} 项"
+        if isinstance(items, list) and items:
+            idx, total = sp._pick_todo_stage(items, todo_count)
+            text = f"todo: 当前第 {idx} 项/共 {total} 项"
+        else:
+            text = "todo/write"
     elif typ == "step/start" and isinstance(data, dict):
         text = f"step/start: 步骤{data.get('step', '')}"
     return text[:TAIL_CUT]
+
+
+# 需要合并的连续同类 chunk 事件类型（占事件流绝大多数且内容无差别）
+_CHUNK_TYPES = ("reasoning-chunks", "tool-call-chunks", "assistant-chunks")
+
+
+def _ts_text(i, times):
+    """事件 i 的时间戳文本：[HH:MM:SS]（有 time 字段）或 [序号]（无 time）。
+
+    times 为与 events 平行的 epoch 秒列表；无 time（None/缺省/非法）时用
+    文件事件顺序序号（1-based 位置）代替，保证每条 tail 都有时间锚点。
+    """
+    t = times[i] if times is not None and i < len(times) else None
+    if isinstance(t, (int, float)) and t > 0:
+        return time.strftime("[%H:%M:%S]", time.localtime(t))
+    return "[%d]" % (i + 1)
+
+
+def format_tail(events, times=None, max_lines=TAIL_LINES):
+    """事件流 → 可读性优化后的 tail 行列表（最多 max_lines 条，合并后计数）。
+
+    规则（按 spec）：
+      - 连续相同的 reasoning-chunks / tool-call-chunks / assistant-chunks
+        合并为一条「type ×N」（N=连续出现次数，N==1 不显示 ×1），不再刷屏；
+      - tool/call 突出为「tool/call 工具名: 参数摘要」（复用 format_action 思路）；
+      - todo/write 显示「todo: 当前第 k 项/共 n 项」；
+      - 每条前加 [HH:MM:SS]（time 字段毫秒时间戳 → 本地时间，times 已换算为秒）；
+        无 time 字段用文件事件顺序序号 [N] 代替；
+      - 保留最近 max_lines 条（合并后计数）。
+
+    events: parse_event 的 (type, data) 列表；times: 平行的 epoch 秒列表
+    （None 表示该事件无 time），与 _read_task 的返回约定一致。
+    """
+    if max_lines <= 0:
+        return []
+    merged = []  # 合并后的 (时间戳文本, 行文本) 列表
+    todo_count = 0
+    i, n = 0, len(events)
+    while i < n:
+        ev = events[i]
+        typ = ev[0] if isinstance(ev, (tuple, list)) and ev else None
+        if typ in _CHUNK_TYPES:
+            # 扫描连续相同 chunk 的运行长度
+            j = i
+            while j < n and isinstance(events[j], (tuple, list)) \
+                    and events[j][0] == typ:
+                j += 1
+            count = j - i
+            text = f"{typ} ×{count}" if count > 1 else typ
+            merged.append((_ts_text(i, times), text))  # 时间戳取运行首事件
+            i = j
+            continue
+        if typ == "todo/write":
+            todo_count += 1
+        merged.append((_ts_text(i, times), format_tail_line(ev, todo_count)))
+        i += 1
+    return [ts + " " + text for ts, text in merged[-max_lines:]]
 
 
 def _read_task(path):
@@ -272,7 +335,7 @@ def _build_task(path, status, now):
             "eta_mode": eta_mode,
             "eta_at": eta_at,
             "elapsed_s": int(now - started_at),
-            "tail": [format_tail_line(e) for e in events[-TAIL_LINES:]],
+            "tail": format_tail(events, times, TAIL_LINES),
         }
     except Exception:
         return None  # 单个任务解析失败静默跳过

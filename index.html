@@ -32,6 +32,11 @@
   .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; margin-top: 6px; }
   .pre.collapse { display: none; }        /* 已完成卡片：事件流默认折叠 */
   .pre.collapse.open { display: block; }  /* 点击展开 */
+  /* tail 新格式：每行一条（等宽字体），tool/todo 行高亮色区分，合并的 chunk 弱化 */
+  .tl { line-height: 1.6; }
+  .tl-tool { color: #93c5fd; }   /* tool/call 动作高亮（蓝） */
+  .tl-todo { color: #fbbf24; }   /* todo/write 进度高亮（黄） */
+  .tl-chunk { color: #5b6472; }  /* 合并后的 reasoning-chunks ×N 等（灰，弱化刷屏项） */
 </style>
 </head>
 <body>
@@ -58,8 +63,18 @@ function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g,
     c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-function tailLines(t) {
-  return t.tail && t.tail.length ? esc(t.tail.join('\n')) : '(暂无事件...)';
+// tail 每行一条渲染：新格式行首为 [HH:MM:SS] 或 [序号]，按内容加高亮类
+// （tool/call 蓝 / todo 黄 / 合并的 chunk 灰），等宽字体由 .pre 保证
+function tailHtml(t) {
+  const lines = t.tail || [];
+  if (!lines.length) return '(暂无事件...)';
+  return lines.map(ln => {
+    const cls = /^\[\S+\] tool\/call /.test(ln) ? ' tl-tool'
+      : /^\[\S+\] todo: /.test(ln) ? ' tl-todo'
+      : /^\[\S+\] (reasoning-chunks|tool-call-chunks|assistant-chunks) ×\d+$/.test(ln) ? ' tl-chunk'
+      : '';
+    return '<div class="tl' + cls + '">' + esc(ln) + '</div>';
+  }).join('');
 }
 // 单个任务卡片（i 用于生成事件流元素的唯一 id）
 function cardHtml(t, i) {
@@ -92,7 +107,7 @@ function cardHtml(t, i) {
       html += '<div class="action"><span class="muted">最近动作:</span> ' + esc(t.action) + '</div>';
     }
     // 运行中卡片：事件流默认展开（max-height 滚动）
-    html += '<div class="pre">' + tailLines(t) + '</div>';
+    html += '<div class="pre">' + tailHtml(t) + '</div>';
   } else {
     // 已完成卡片：最后阶段名 + 事件流默认折叠（点击展开，防信息过载）
     html += '<div class="action"><span class="muted">最后阶段:</span> ' + esc(stage || '(无阶段信息)') + '</div>';
@@ -101,7 +116,7 @@ function cardHtml(t, i) {
     }
     const tid = 'tail-' + i;
     html += '<div class="tail-btn" onclick="toggleTail(\'' + tid + '\')" id="' + tid + '-btn">📜 事件流（点击展开）</div>';
-    html += '<div class="pre collapse" id="' + tid + '">' + tailLines(t) + '</div>';
+    html += '<div class="pre collapse" id="' + tid + '">' + tailHtml(t) + '</div>';
   }
   html += '</div>';
   return html;

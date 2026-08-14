@@ -1,0 +1,38 @@
+# dsh-progress-viz CI：push 到 main + pull_request 触发
+# 矩阵：3 平台（ubuntu/macos/windows）× 2 Python 版本（3.9/3.11）
+# 步骤：checkout → setup-python → pip install zstandard → 逐套跑单测（断言 exit 0）
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 安装依赖（zstandard）
+        run: pip install zstandard
+
+      # 路径统一用正斜杠（Windows runner 同样可执行）；每套测试 exit 0 才算通过
+      - name: 单测 test_session_progress
+        run: python tests/test_session_progress.py
+      - name: 单测 test_eta_blend
+        run: python tests/test_eta_blend.py
+      - name: 单测 test_multi_pane
+        run: python tests/test_multi_pane.py
+      - name: 单测 test_tail_format
+        run: python tests/test_tail_format.py
