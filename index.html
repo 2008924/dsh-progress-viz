@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>dsh Progress Viz</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 20px; }
+  h1 { font-size: 20px; border-bottom: 1px solid #2a2d35; padding-bottom: 10px; }
+  h2 { font-size: 15px; color: #8b93a7; margin-top: 24px; }
+  .card { background: #171a21; border: 1px solid #2a2d35; border-radius: 8px; padding: 14px 18px; margin: 8px 0; }
+  .ok { color: #4ade80; font-weight: bold; }
+  .muted { color: #8b93a7; font-size: 12px; }
+  .bar { background: #22262f; border-radius: 4px; height: 6px; margin: 6px 0; overflow: hidden; }
+  .bar-inner { background: #4ade80; height: 100%; border-radius: 4px; transition: width 0.5s; }
+  .stage-bar { background: #22262f; border-radius: 6px; height: 10px; margin: 8px 0 4px; overflow: hidden; }
+  .stage-bar-inner { background: linear-gradient(90deg, #60a5fa, #a78bfa); height: 100%; border-radius: 6px; transition: width 0.5s; }
+  .stage-name { font-size: 14px; font-weight: bold; color: #93c5fd; }
+  .eta { font-size: 14px; color: #fbbf24; font-weight: bold; }
+  .eta-muted { color: #8b93a7; font-size: 12px; font-weight: normal; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot-running { background: #60a5fa; animation: pulse 1s infinite; }
+  .dot-done { background: #4ade80; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 300px; overflow-y: auto; }
+  #running-status { font-size: 14px; }
+  .badge { display: inline-block; background: #2a2d35; border-radius: 10px; padding: 2px 10px; font-size: 12px; margin-left: 8px; }
+  .action { margin-top: 6px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>📊 dsh Progress Viz <span class="muted">(每 5 秒自动刷新)</span></h1>
+
+<h2>📡 当前任务</h2>
+<div class="card" id="running-status">查询中...</div>
+
+<script>
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s || 0));
+  if (s >= 3600) return Math.floor(s/3600) + 'h ' + Math.floor(s%3600/60) + 'm';
+  if (s >= 60) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return s + 's';
+}
+async function load() {
+  try {
+    const res = await fetch('/api/live');
+    const live = await res.json();
+    const rs = document.getElementById('running-status');
+    if (live.running) {
+      let html = '<span class="status-dot dot-running"></span><span class="ok">正在运行</span>' +
+        (live.tag ? '<span class="badge">' + live.tag + '</span>' : '') +
+        '<span class="muted">任务 ' + (live.task || '') + ' · 已运行 ' + fmtDur(live.elapsed_s) + '</span>';
+      // 阶段进度条
+      if (live.stage_idx && live.stage_total) {
+        const pct = live.stage_pct || Math.round(live.stage_idx / live.stage_total * 100);
+        html += '<div style="margin-top:10px;">' +
+          '<span class="stage-name">阶段 ' + live.stage_idx + '/' + live.stage_total + ' · ' + (live.stage || '') + '</span>' +
+          '<span class="muted" style="float:right">' + pct + '%</span>' +
+          '<div class="stage-bar"><div class="stage-bar-inner" style="width:' + pct + '%"></div></div></div>';
+      }
+      // ETA
+      if (live.eta_at) {
+        const modeTxt = live.eta_mode === 'linear' ? '按阶段速度推算' : '';
+        html += '<div style="margin-top:6px;"><span class="eta">⏱ 预计完成 ' + live.eta_at +
+          ' <span class="eta-muted">(剩余 ' + fmtDur(live.eta_s) + (modeTxt ? ' · ' + modeTxt : '') + ')</span></span></div>';
+      }
+      // 最近动作
+      if (live.action) {
+        html += '<div class="action"><span class="muted">最近动作:</span> ' + live.action + '</div>';
+      }
+      // tail：事件流（headless 无 stdout，事件流就是任务的"输出"）
+      html += '<h2>📜 事件流</h2>' +
+        '<div class="pre">' + (live.tail && live.tail.length ? live.tail.join('\n') : '(暂无事件...)') + '</div>';
+      rs.innerHTML = html;
+    } else {
+      rs.innerHTML = '<span class="status-dot dot-done"></span> 等待 dsh 任务开始...' +
+        '<div class="muted" style="margin-top:8px;">未在 ~/.dsh/sessions 下发现会话，' +
+        '启动一个 dsh headless 任务后，这里会自动显示阶段 / ETA / 事件流。</div>';
+    }
+  } catch (e) {
+    document.getElementById('running-status').textContent = '看板 API 不可用: ' + e.message;
+  }
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
