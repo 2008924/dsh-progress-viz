@@ -45,6 +45,15 @@ pip install zstandard>=0.21
 python dashboard.py 8123
 ```
 
+启动行为：
+
+- **自动打开浏览器**：服务器启动成功后自动用系统默认浏览器打开
+  <http://127.0.0.1:<实际端口>>；
+- **端口冲突自动递增**：指定端口（或默认 8123）被占用时自动 +1 重试
+  （最多 5 次），并打印「端口 X 被占用，改用 Y」；连续 5 个端口都被占用才报错退出；
+- **`--no-open`**：启动时不自动打开浏览器（如远程/无头环境）：
+  `python dashboard.py 8123 --no-open`。
+
 浏览器打开 <http://127.0.0.1:8123>：
 
 - **多任务分栏**：看板扫描 `~/.dsh/sessions` 下**全部**会话，只保留**最近 1 小时**内有写入
@@ -91,6 +100,7 @@ python tests/test_session_progress.py  # 跑全部单测（无需 pytest），ex
 python tests/test_eta_blend.py         # ETA 融合算法单测（历史会话 fixture 生成到临时目录）
 python tests/test_multi_pane.py        # 多任务分栏单测（1 小时窗口 / mtime 排序 / status 判定）
 python tests/test_tail_format.py       # tail 可读性单测（chunk 合并 / 时间戳 / 动作高亮 / 截断）
+python tests/test_port.py              # 端口冲突自动递增单测（socket 占用模拟，随机高位端口）
 ```
 
 GitHub Actions CI（`.github/workflows/ci.yml`）在 push 到 main 与 pull_request 时，
@@ -110,6 +120,7 @@ dsh-progress-viz/
 │   ├── test_eta_blend.py             # ETA 融合算法单测
 │   ├── test_multi_pane.py            # 多任务分栏单测
 │   ├── test_tail_format.py           # tail 可读性单测
+│   ├── test_port.py                  # 端口冲突自动递增单测
 │   └── fixtures/session-synthetic.jsonl.zstd
 ├── README.md
 ├── LICENSE

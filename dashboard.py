@@ -10,15 +10,18 @@ ETA 为「阶段线性外推 + 同目录历史会话耗时中位数」加权融�
 compute_hist_s / blend_eta），历史会话排除任务自身。
 
 用法: python dashboard.py [port]   (默认 8123)
-  浏览器打开 http://127.0.0.1:8123
+  启动成功后自动用默认浏览器打开 http://127.0.0.1:<实际端口>
+  （--no-open 关闭自动打开）；端口被占用时自动 +1 递增（最多 5 次）。
 
 纯本地运行，任何解压/解析失败都静默容忍，绝不崩溃。
 """
+import argparse
 import json
 import os
-import sys
+import socket
 import threading
 import time
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -564,9 +567,52 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def build_parser():
+    """命令行参数解析器（argparse）。
+
+    位置参数 port 兼容旧的 `python dashboard.py 8123` 用法（缺省 8123）；
+    --no-open 关闭启动后自动打开浏览器的行为。
+    """
+    parser = argparse.ArgumentParser(
+        description="dsh 进度可视化看板服务器（纯本地）")
+    parser.add_argument("port", nargs="?", type=int, default=8123,
+                        help="监听端口（默认 8123；被占用时自动 +1 递增，最多 5 次）")
+    parser.add_argument("--no-open", action="store_true",
+                        help="启动后不自动打开浏览器（默认自动打开）")
+    return parser
+
+
+def _port_free(port):
+    """端口空闲检测：能否绑定 127.0.0.1:port（能绑定即空闲）。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", port))
+            return True
+    except OSError:
+        return False
+
+
+def pick_free_port(start, tries=5):
+    """端口冲突自动递增：start 被占用时自动 +1 重试（最多 tries 次）。
+
+    找到空闲端口即返回实际端口；每次切换打印「端口 X 被占用，改用 Y」；
+    连续 tries 个端口全部被占用 → SystemExit 报错退出（不捕获即进程退出）。
+    """
+    for i in range(tries):
+        p = start + i
+        if _port_free(p):
+            return p
+        if i + 1 < tries:
+            print(f"端口 {p} 被占用，改用 {p + 1}", flush=True)
+    raise SystemExit(f"端口 {start}~{start + tries - 1} 全部被占用，启动失败")
+
+
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8123
+    args = build_parser().parse_args()
+    port = pick_free_port(args.port)  # 端口冲突自动递增（最多 5 次）
     threading.Thread(target=poll_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"dsh progress viz: http://127.0.0.1:{port}", flush=True)
+    if not args.no_open:
+        webbrowser.open(f"http://127.0.0.1:{port}")  # 启动成功后自动打开浏览器
     srv.serve_forever()
