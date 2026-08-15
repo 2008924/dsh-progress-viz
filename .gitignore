@@ -7,3 +7,7 @@ __pycache__/
 
 # 日志
 *.log
+
+plugin/node_modules/
+plugin/.pnpm-store/
+

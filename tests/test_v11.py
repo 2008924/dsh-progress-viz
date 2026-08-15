@@ -316,7 +316,7 @@ with_root(t4b)
 
 print("== ⑤ timeline 生成（事件 → 摘要列表条数/格式）==")
 evs = [("step/start", {"step": 1})]
-evs += [("reasoning-chunks", None)] * 5          # 连续 5 条 → 合并 ×5
+evs += [("reasoning-chunks", None)] * 5          # 连续 5 条 → 显示层过滤（不合并）
 evs += [("todo/write", {"todos": [
     {"content": "步骤A", "status": "completed"},
     {"content": "步骤B", "status": "in_progress"},
@@ -334,9 +334,9 @@ tl = db.build_timeline(evs, times)
 check("timeline 每条含 t/type/desc", all(
     isinstance(it, dict) and "t" in it and "type" in it and "desc" in it
     for it in tl), str(tl))
-check("timeline 条数 = 7（chunk 合并为 1 条）", len(tl) == 7, str(len(tl)))
-check("chunk 连续合并 desc=×5", any(
-    it["type"] == "reasoning-chunks" and it["desc"] == "×5" for it in tl), str(tl))
+check("timeline 条数 = 6（chunk 类事件被过滤）", len(tl) == 6, str(len(tl)))
+check("chunk 类事件全部被过滤（无 reasoning-chunks）", not any(
+    it["type"] == "reasoning-chunks" for it in tl), str(tl))
 check("tool/call desc 不含类型前缀（bash: pytest -q）", any(
     it["type"] == "tool/call" and it["desc"] == "bash: pytest -q" for it in tl), str(tl))
 check("assistant/message desc 取文本", any(
@@ -352,7 +352,7 @@ check("有 time 条目 t 为 HH:MM:SS", all(
 
 # max_items 截断（取最近 N 条）
 tl10 = db.build_timeline(evs, times, max_items=10)
-check("max_items=10 ≥ 实际条数 → 全部保留", len(tl10) == 7, str(len(tl10)))
+check("max_items=10 ≥ 实际条数 → 全部保留", len(tl10) == 6, str(len(tl10)))
 many = [("step/start", {"step": i}) for i in range(1, 61)]  # 步骤1..60
 tl50 = db.build_timeline(many, [base_t + i for i in range(60)], max_items=50)
 check("超 50 条 → 只保留最近 50 条", len(tl50) == 50, str(len(tl50)))

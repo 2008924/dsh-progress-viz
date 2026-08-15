@@ -30,14 +30,14 @@
   .action { margin-top: 6px; font-size: 13px; }
   .cost { color: #fbbf24; font-weight: bold; font-size: 13px; }  /* 成本估算值（黄色高亮） */
   .tail-btn { margin-top: 8px; cursor: pointer; color: #60a5fa; font-size: 13px; user-select: none; }
-  .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; margin-top: 6px; }
+  .pre { background: #0d0f13; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 60vh; overflow-y: auto; margin-top: 6px; }
   .pre.collapse { display: none; }        /* 已完成卡片：事件流默认折叠 */
   .pre.collapse.open { display: block; }  /* 点击展开 */
-  /* tail 新格式：每行一条（等宽字体），tool/todo 行高亮色区分，合并的 chunk 弱化 */
+  /* tail 新格式：每行一条（等宽字体），tool/todo 行高亮色区分；
+     chunk 类事件已在显示层过滤（只保留语义事件），无合并弱化项 */
   .tl { line-height: 1.6; }
   .tl-tool { color: #93c5fd; }   /* tool/call 动作高亮（蓝） */
   .tl-todo { color: #fbbf24; }   /* todo/write 进度高亮（黄） */
-  .tl-chunk { color: #5b6472; }  /* 合并后的 reasoning-chunks ×N 等（灰，弱化刷屏项） */
   .tl-type { color: #8b93a7; }   /* 时间线条目的事件类型（灰） */
 </style>
 </head>
@@ -65,32 +65,30 @@ function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g,
     c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
-// tail 每行一条渲染：新格式行首为 [HH:MM:SS] 或 [序号]，按内容加高亮类
-// （tool/call 蓝 / todo 黄 / 合并的 chunk 灰），等宽字体由 .pre 保证
+// tail 每行一条渲染：后端 format_tail 已过滤 chunk 并倒序（最新在上），
+// 行首为 [HH:MM:SS] 或 [序号]，按内容加高亮类（tool/call 蓝 / todo 黄）
 function tailHtml(t) {
   const lines = t.tail || [];
   if (!lines.length) return '(暂无事件...)';
   return lines.map(ln => {
     const cls = /^\[\S+\] tool\/call /.test(ln) ? ' tl-tool'
       : /^\[\S+\] todo: /.test(ln) ? ' tl-todo'
-      : /^\[\S+\] (reasoning-chunks|tool-call-chunks|assistant-chunks) ×\d+$/.test(ln) ? ' tl-chunk'
       : '';
     return '<div class="tl' + cls + '">' + esc(ln) + '</div>';
   }).join('');
 }
-// 详情时间线渲染：结构化 [{t, type, desc}]，每条一行（等宽字体由 .pre 保证），
-// 时间戳 + 事件类型（灰）+ 描述（tool 蓝 / todo 黄 高亮）
+// 详情时间线渲染：结构化 [{t, type, desc}]，每条一行；倒序展示（最新在上，
+// 与 tail 一致），时间戳 + 事件类型（灰）+ 描述（tool 蓝 / todo 黄 高亮）
 function timelineHtml(t) {
   const items = t.timeline || [];
   if (!items.length) return '(暂无详情...)';
-  return items.map(it => {
+  return items.slice().reverse().map(it => {
     const ty = esc(it.type || '');
     const ds = esc(it.desc || '');
     const ttag = esc(it.t || '');
     let cls = '';
     if (ty === 'tool/call') cls = ' tl-tool';
     else if (ty === 'todo/write') cls = ' tl-todo';
-    else if (ty === 'reasoning-chunks' || ty === 'tool-call-chunks' || ty === 'assistant-chunks') cls = ' tl-chunk';
     return '<div class="tl"><span class="tl-type">[' + ttag + ']</span> <span class="tl-type">' + ty + '</span>' +
       (ds ? '<span class="' + cls + '"> · ' + ds + '</span>' : '') + '</div>';
   }).join('');

@@ -65,6 +65,35 @@ def t1(root):
     check("120s 历史会话耗时 = 120.0", d1 is not None and abs(d1 - 120.0) < 1e-9, str(d1))
 with_root(t1)
 
+print("== ①b 毫秒时间戳单位换算（time 字段是毫秒 → hist_s 必须转秒）==")
+def t1b(root):
+    # 构造毫秒时间戳会话：首尾 time 差 = 21552ms（≈21.5 秒）——复现历史 bug：
+    # 若把「毫秒时间戳差」当成「秒」，hist_s 会变成 21552（ETA 显示 5 小时 59 分）。
+    start_ms = 1787000000000
+    sid = "session-ms-unit-0000"
+    evs = [{"type": "session", "version": 0, "id": sid,
+            "createdAt": start_ms, "cwd": mf.CWD, "delegationDepth": 0,
+            "time": start_ms}]
+    for i in range(1, 4):
+        evs.append({"type": "step/start", "seq": i,
+                    "time": start_ms + 21552 * i // 3,
+                    "data": {"turn": 1, "step": i}})
+    path = os.path.join(root, sp.encode_cwd(mf.CWD), sid, "session.jsonl.zstd")
+    mf.write_fixture(path, evs)
+    dur = db._session_duration(path)
+    check("21552ms 首尾差 → 耗时 ≈ 21.552 秒（非 21552）",
+          dur is not None and abs(dur - 21.552) < 1e-3, str(dur))
+    hist = db.compute_hist_s(mf.CWD, None)
+    check("hist_s 正确转秒（21.552，而非 21552）",
+          abs(hist - 21.552) < 1e-3, str(hist))
+    # 端到端：ETA 融合结果应为秒级（分钟级），而不是 5 小时 59 分
+    st = state(2, 3, 21.552 * 0.5)  # k=2 → α=0.5
+    eta, mode = db.blend_eta(st, hist)
+    check("blend ETA 为秒级（<3600s，修复后不再 6 小时）",
+          mode == "blend" and eta is not None and eta < 3600,
+          f"eta={eta} mode={mode}")
+with_root(t1b)
+
 print("== ② 中位数逻辑（奇数/偶数个历史会话）==")
 check("偶数个 [60,120] → 90", db._median([60, 120]) == 90, str(db._median([60, 120])))
 check("奇数个 [60,120,180] → 120", db._median([60, 120, 180]) == 120,

@@ -106,6 +106,61 @@ tail, cost_est, timeline} ]}`，无任务时 `tasks=[]`。每个任务的 ETA �
 - **详情时间线（E）**：`/api/live` 任务对象新增 `timeline` 字段（`[{t, type, desc}]`，
   最多 50 条，chunk 连续合并、取最近）；运行中卡片「详情」点击展开。
 
+## 插件版（dsh-progress-viz-plugin）
+
+除了「独立版」（看板直接 zstd 解析会话文件），本工具提供 **cordis 插件版**：
+插件挂载到 dsh profile（任务执行的地方，如 headless），**实时监听会话事件**，
+只保留语义事件（`todo/write`、`step/start`、`step/end`、`tool/call`、
+`tool/result`、`assistant/message`、`turn/start`、`turn/end`、`session/title`、
+`session`），过滤 chunk 等中间态噪音（`assistant/chunk`、`reasoning-chunks`、
+`tool-call-chunks`、`text-chunks`、`request/*` 等），原子重写
+`<DSH_HOME>/progress/<session-id>.json`（及 `current.json`）供看板消费。
+
+**与独立版的关系**：看板新增数据源，**优先读插件输出**（实时、已过滤噪音）；
+`<DSH_HOME>/progress/` 缺失或没有文件时，**自动回退**现有 zstd 解析路径
+（行为不变，新增优先级不影响回退）。`/api/live` 字段语义不变（插件任务
+`eta_*` 为 `None`、`tail` 由 `timeline` 派生）。
+
+### 安装（dsh plugin add）
+
+插件源码在 `plugin/` 目录（TypeScript、ESM、`lib/index.js` 产物）。构建并挂载：
+
+```bash
+cd publish/dsh-progress-viz/plugin
+pnpm install --registry https://registry.npmmirror.com   # 国内 registry
+pnpm build                                                # tsc → lib/index.js
+# 回到任意目录，把插件挂到 headless profile（本地目录绝对路径）：
+dsh plugin --profile headless add <plugin 目录绝对路径>
+dsh --profile headless --dump-config   # 验证输出包含 progress-viz
+```
+
+> `dsh plugin add` 会执行 `pnpm add <路径>` 并把本包加入 profile 的
+> `dsh.profile.bundles`（插件包声明了 `dsh.bundle.patch`）。若环境不支持
+> `dsh plugin`，可手动把插件加入 profile `package.json` 的 `dependencies`
+> 与 `dsh.profile.bundles` 数组后执行 `pnpm install`。插件零配置可挂载。
+
+### 输出格式
+
+每个会话一个文件：`<DSH_HOME>/progress/<session-id>.json`（原子写：临时文件 +
+rename，每次语义事件更新重写）；会话结束（`session/disposed` 或空闲超时）后
+标记 `finished: true` 并保留文件；新会话开始（`session/created`）时重置状态。
+
+```json
+{
+  "session_id": "session-xxxxxxxx-...",
+  "title": "任务标题", "cwd": "C:\\work",
+  "stage": "当前阶段", "stage_idx": 2, "stage_total": 3, "stage_pct": 67,
+  "action": "运行 bash 命令: pytest -q",
+  "cost_est": 0.0123, "elapsed_s": 42,
+  "updated_at": "2026-08-15T12:00:00.000Z", "finished": false,
+  "timeline": [{"t": "12:00:01", "type": "todo/write", "desc": "当前第 2 项/共 3 项"}]
+}
+```
+
+阶段逻辑与独立版一致（todo 第一个未完成项优先、`step/start` 计数兜底）；
+成本按同一 DeepSeek 定价常量估算（无 usage → `null`）。详见
+[plugin/README.md](plugin/README.md)。
+
 ## 阶段与 ETA 说明
 
 - **阶段**来自模型的 `todo/write` 任务清单（取第一个未完成项，idx 从 1 开始）；模型**必须使用 todo 工具**维护清单才能显示阶段。建议在任务提示里引导，例如：

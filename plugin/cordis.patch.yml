@@ -1,0 +1,13 @@
+# dsh-progress-viz 插件 bundle patch：在目标 profile 中挂载进度可视化插件。
+# 安装方式：dsh plugin --profile headless add <本插件目录>
+# （本包 package.json 声明 dsh.bundle.patch，dsh plugin add 会自动把本包
+#   加入 profile 的 dsh.profile.bundles 层，此 patch 随后被应用）。
+# 插件零配置可挂载：所有配置项带默认值（输出到 <DSH_HOME>/progress）。
+- insert:
+    - id: progress-viz
+      name: 'dsh-progress-viz-plugin'
+      config:
+        outDir: ''
+        idleTimeoutMs: 15000
+        timelineMax: 50
+        writeCurrent: true

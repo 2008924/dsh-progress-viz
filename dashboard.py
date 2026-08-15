@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """dsh 进度可视化 —— 多任务分栏看板服务器（零 dsh-project 依赖，可单独运行）
 
+数据源（按优先级，spec 2026-08-15 插件版）：
+  1. 插件输出 <DSH_HOME>/progress/*.json（dsh-progress-viz-plugin 实时写入、
+     已过滤 chunk 噪音）—— read_progress_json 读取，字段与 /api/live 对齐；
+  2. 缺失/无文件 → 回退 zstd 会话解析（scan_session_files，行为不变）。
 不依赖 dsh_dispatch.py / running.json：直接监控 ~/.dsh/sessions 下**所有**
 cwd 编码目录里的全部会话文件（session.jsonl.zstd），收集为「最近任务列表」：
 只保留最近 1 小时内有写入的任务，按文件 mtime 降序取前 8 个；每个任务
@@ -25,6 +29,7 @@ compute_hist_s / blend_eta），历史会话排除任务自身。
 纯本地运行，任何解压/解析失败都静默容忍，绝不崩溃。
 """
 import argparse
+import datetime
 import json
 import os
 import socket
@@ -52,6 +57,13 @@ TIMELINE_MAX = 50     # 任务详情时间线条数上限（最多 50 条，取�
 #   本机会话模型为 deepseek-v4-flash，按 deepseek-chat 价近似估算。
 #   价格可改：修改本常量后重启看板即生效（成本为估算值，字段名 cost_est 标注）。
 PRICES = {"input": 2.0, "output": 8.0, "cache_read": 0.5}
+
+# —— 插件版数据源（dsh-progress-viz-plugin 输出）——
+# <DSH_HOME>/progress/*.json（每次语义事件原子重写，已过滤 chunk 噪音）。
+# 测试可重定向本变量（与 sp.SESSIONS_ROOT 同模式）。
+PROGRESS_ROOT = os.path.join(
+    os.environ.get("DSH_HOME") or os.path.join(os.path.expanduser("~"), ".dsh"),
+    "progress")
 
 # —— 共享状态：后台轮询线程写入，HTTP 线程只读（_LOCK 保护）——
 _LOCK = threading.Lock()
@@ -280,8 +292,15 @@ def format_tail_line(ev, todo_count=0):
     return text[:TAIL_CUT]
 
 
-# 需要合并的连续同类 chunk 事件类型（占事件流绝大多数且内容无差别）
-_CHUNK_TYPES = ("reasoning-chunks", "tool-call-chunks", "assistant-chunks")
+# 语义事件白名单（显示层只保留这些事件，与插件 SEMANTIC_TYPES 一致）：
+#   todo/write、step/start、step/end、tool/call、tool/result、assistant/message、
+#   turn/start、turn/end、session/title、session。
+# 其余 chunk 类中间态事件（assistant/chunk、reasoning-chunks、tool-call-chunks、
+# text-chunks、agent/inbox/spliced、request/* 等）占事件流绝大多数且内容无差别，
+# 一律**过滤**（不再合并展示），避免 tail/timeline 被刷屏。
+_SEMANTIC_TYPES = frozenset((
+    "todo/write", "step/start", "step/end", "tool/call", "tool/result",
+    "assistant/message", "turn/start", "turn/end", "session/title", "session"))
 
 
 def _ts_text(i, times):
@@ -297,44 +316,39 @@ def _ts_text(i, times):
 
 
 def format_tail(events, times=None, max_lines=TAIL_LINES):
-    """事件流 → 可读性优化后的 tail 行列表（最多 max_lines 条，合并后计数）。
+    """事件流 → 可读性优化后的 tail 行列表（最多 max_lines 条，**倒序**：最新在上）。
 
-    规则（按 spec）：
-      - 连续相同的 reasoning-chunks / tool-call-chunks / assistant-chunks
-        合并为一条「type ×N」（N=连续出现次数，N==1 不显示 ×1），不再刷屏；
+    规则（按 spec fix-bugs）：
+      - 显示层**过滤**所有 chunk 类事件（assistant/chunk、reasoning-chunks、
+        tool-call-chunks、text-chunks 等），只保留语义事件（todo/write、
+        step/start、step/end、tool/call、tool/result、assistant/message、
+        turn/start、turn/end、session/title、session），不再刷屏；
       - tool/call 突出为「tool/call 工具名: 参数摘要」（复用 format_action 思路）；
       - todo/write 显示「todo: 当前第 k 项/共 n 项」；
       - 每条前加 [HH:MM:SS]（time 字段毫秒时间戳 → 本地时间，times 已换算为秒）；
         无 time 字段用文件事件顺序序号 [N] 代替；
-      - 保留最近 max_lines 条（合并后计数）。
+      - 保留最近 max_lines 条（过滤后计数），并**倒序**返回（最新事件在最上面）。
 
     events: parse_event 的 (type, data) 列表；times: 平行的 epoch 秒列表
     （None 表示该事件无 time），与 _read_task 的返回约定一致。
     """
     if max_lines <= 0:
         return []
-    merged = []  # 合并后的 (时间戳文本, 行文本) 列表
+    kept = []  # 过滤后的 (时间戳文本, 行文本) 列表（按事件顺序）
     todo_count = 0
     i, n = 0, len(events)
     while i < n:
         ev = events[i]
         typ = ev[0] if isinstance(ev, (tuple, list)) and ev else None
-        if typ in _CHUNK_TYPES:
-            # 扫描连续相同 chunk 的运行长度
-            j = i
-            while j < n and isinstance(events[j], (tuple, list)) \
-                    and events[j][0] == typ:
-                j += 1
-            count = j - i
-            text = f"{typ} ×{count}" if count > 1 else typ
-            merged.append((_ts_text(i, times), text))  # 时间戳取运行首事件
-            i = j
+        if typ not in _SEMANTIC_TYPES:
+            i += 1  # 过滤 chunk 等中间态噪音（不显示、不计数）
             continue
         if typ == "todo/write":
             todo_count += 1
-        merged.append((_ts_text(i, times), format_tail_line(ev, todo_count)))
+        kept.append((_ts_text(i, times), format_tail_line(ev, todo_count)))
         i += 1
-    return [ts + " " + text for ts, text in merged[-max_lines:]]
+    # 倒序：最新事件在最上面（先保留最近 max_lines 条，再反转）
+    return [ts + " " + text for ts, text in kept[-max_lines:]][::-1]
 
 
 def _timeline_desc(ev, todo_count):
@@ -364,10 +378,11 @@ def _timeline_desc(ev, todo_count):
 def build_timeline(events, times=None, max_items=TIMELINE_MAX):
     """事件流 → 任务详情时间线摘要列表（[{t, type, desc}]，最多 max_items 条）。
 
-    与 format_tail 同规则（连续同类 chunk 合并 ×N / todo 进度 / tool 摘要），
+    与 format_tail 同规则（过滤 chunk 等中间态噪音 / todo 进度 / tool 摘要），
     但保留结构化字段供前端渲染：t 为 HH:MM:SS（无 time 用文件事件顺序序号），
     type 为事件类型，desc 为不含类型前缀的简短描述。取**最近** max_items 条
-    （时间线随任务推进滚动，上限 50 条防页面过载）。
+    （时间线随任务推进滚动，上限 50 条防页面过载）。**保持事件正序**返回，
+    展示倒序由前端 timelineHtml 处理（最新在上）。
     """
     if max_items <= 0:
         return []
@@ -377,19 +392,11 @@ def build_timeline(events, times=None, max_items=TIMELINE_MAX):
     while i < n:
         ev = events[i]
         typ = ev[0] if isinstance(ev, (tuple, list)) and ev else None
+        if typ not in _SEMANTIC_TYPES:
+            i += 1  # 过滤 chunk 等中间态噪音（不显示、不计数）
+            continue
         ts = _ts_text(i, times)
         t = ts[1:-1] if len(ts) >= 3 and ts[0] == "[" and ts[-1] == "]" else ts
-        if typ in _CHUNK_TYPES:
-            # 连续相同 chunk 的运行长度 → 合并为 1 条（与 format_tail 一致）
-            j = i
-            while j < n and isinstance(events[j], (tuple, list)) \
-                    and events[j][0] == typ:
-                j += 1
-            count = j - i
-            items.append({"t": t, "type": typ,
-                          "desc": f"×{count}" if count > 1 else ""})
-            i = j
-            continue
         if typ == "todo/write":
             todo_count += 1
         items.append({"t": t, "type": typ,
@@ -583,18 +590,145 @@ def _build_task(path, status, now):
         return None  # 单个任务解析失败静默跳过
 
 
-def scan_tasks(now=None):
-    """全库扫描 → 最近任务列表（多任务分栏数据源）。
+def _plugin_task(path, data, now):
+    """单个插件进度 JSON → 任务 dict（字段与 zstd 解析结果对齐）。
 
-    - 收集全部会话文件，只保留最近 1 小时内有写入（mtime 距今 < 3600s）的；
-    - 按 mtime 降序取前 8 个；
-    - 每个任务独立解析（解析缓存：文件 mtime 未变直接复用，不重复解压）；
-      status：文件 mtime 距今 ≤ 30s → running，否则 completed；
-    - 扫描后清理解析缓存：会话被删除/目录消失 → 对应缓存条目随之失效；
-    - 单个会话扫描/解析失败静默跳过；无任务返回 []。
+    字段语义（/api/live 不变）：
+      - id：session_id 去 "session-" 前缀后前 8 位（与 zstd 路径同规则）；
+      - status：finished → completed；未结束时沿用 mtime 年龄语义
+        （≤ RUNNING_AGE → running，更旧 → completed）；
+      - tail：由 timeline 派生（"[HH:MM:SS] type: desc" 行，取最近 TAIL_LINES 条，
+        **倒序**：最新事件在最上面，与 zstd 路径 format_tail 一致）；
+      - eta_s/eta_mode/eta_at：插件 JSON 无阶段时间戳 → None（前端不显示）；
+      - elapsed_s：以 JSON 的 updated_at 与 elapsed_s 反推 started_at，
+        按当前 now 刷新（与 zstd 路径的刷新语义一致）。
+    """
+    sid = data.get("session_id") or ""
+    tag = sid[8:16] if sid.startswith("session-") else (sid[:8] or None)
+    timeline = data.get("timeline")
+    if not isinstance(timeline, list):
+        timeline = []
+    tail = []
+    for it in reversed(timeline[-TAIL_LINES:]):  # 倒序：最新事件在最上面
+        if isinstance(it, dict):
+            line = "[%s] %s: %s" % (it.get("t") or "", it.get("type") or "",
+                                    it.get("desc") or "")
+            tail.append(line.strip()[:TAIL_CUT])
+    finished = bool(data.get("finished"))
+    try:
+        age = now - os.path.getmtime(path)
+    except OSError:
+        age = now
+    status = "completed" if finished or age > RUNNING_AGE else "running"
+    # elapsed_s 刷新：started_at ≈ updated_at − 写时 elapsed_s
+    elapsed = data.get("elapsed_s")
+    if not isinstance(elapsed, (int, float)) or elapsed < 0:
+        elapsed = 0
+    updated = data.get("updated_at")
+    if isinstance(updated, str) and updated:
+        try:
+            upd_ts = datetime.datetime.fromisoformat(
+                updated.replace("Z", "+00:00")).timestamp()
+            elapsed = int(now - (upd_ts - float(elapsed)))
+        except (ValueError, TypeError):
+            elapsed = int(elapsed)
+    else:
+        elapsed = int(elapsed)
+    return {
+        "id": tag,
+        "cwd": data.get("cwd"),
+        "title": data.get("title"),
+        "status": status,
+        "stage": data.get("stage"),
+        "stage_idx": data.get("stage_idx") or 0,
+        "stage_total": data.get("stage_total") or 0,
+        "stage_pct": data.get("stage_pct") or 0,
+        "action": data.get("action"),
+        "eta_s": None,       # 插件 JSON 无阶段时间戳 → ETA 不估算
+        "eta_mode": None,
+        "eta_at": None,
+        "cost_est": data.get("cost_est"),
+        "timeline": timeline,
+        "tail": tail,
+        "elapsed_s": elapsed,
+        "_sid": sid,         # 私有键：仅供飞书通知去重，不对外
+    }
+
+
+def read_progress_json(now=None):
+    """读取插件输出的进度 JSON（<DSH_HOME>/progress/*.json，数据源优先级 1）。
+
+    - 只读 per-session 文件（排除 current.json：它是最新会话的指针，
+      与 per-session 文件内容重复，避免同一任务出现两次）；
+    - 按文件 mtime 降序，只保留最近 RECENT_WINDOW 秒内有更新的文件，
+      取前 MAX_TASKS 个（与 zstd 扫描同一窗口/上限语义）；
+    - 单个文件读取/解析失败静默跳过（损坏文件不崩溃）；
+    - 目录不存在或无文件 → []（调用方回退 zstd 解析）。
     """
     if now is None:
         now = time.time()
+    root = PROGRESS_ROOT
+    if not os.path.isdir(root):
+        return []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    files = []
+    for name in names:
+        if not name.endswith(".json") or name == "current.json":
+            continue
+        p = os.path.join(root, name)
+        try:
+            if os.path.isfile(p):
+                files.append((p, os.path.getmtime(p)))
+        except OSError:
+            continue
+    files.sort(key=lambda x: x[1], reverse=True)  # 按 mtime 降序
+    tasks = []
+    for path, mt in files:
+        age = now - mt
+        if age >= RECENT_WINDOW:
+            break  # 已按 mtime 降序 → 之后只会更旧 → 直接结束
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or not data.get("session_id"):
+                continue
+            task = _plugin_task(path, data, now)
+        except (OSError, ValueError, json.JSONDecodeError, TypeError):
+            continue  # 损坏文件静默跳过
+        tasks.append(task)
+        if len(tasks) >= MAX_TASKS:
+            break
+    return tasks
+
+
+def scan_tasks(now=None):
+    """全库扫描 → 最近任务列表（多任务分栏数据源）。
+
+    数据源优先级（按 spec 插件版）：
+      1. 插件输出 <DSH_HOME>/progress/*.json（实时、已过滤噪音）——
+         read_progress_json 读取，字段与 /api/live 对齐；
+      2. 缺失/无文件 → 回退现有 zstd 会话解析（行为不变）。
+    插件数据路径说明：
+      - 收集插件 JSON，只保留最近 1 小时内有写入（mtime 距今 < 3600s）的；
+      - 按 mtime 降序取前 MAX_TASKS 个；status 由 finished 标志 + mtime
+        年龄判定（finished → completed，否则 ≤30s → running）；
+      - 单个文件损坏静默跳过。
+    zstd 回退路径说明（原逻辑不变）：
+      - 收集全部会话文件，只保留最近 1 小时内有写入的；
+      - 按 mtime 降序取前 8 个；每个任务独立解析（解析缓存：文件 mtime
+        未变直接复用，不重复解压）；status：mtime 距今 ≤ 30s → running，
+        否则 completed；
+      - 扫描后清理解析缓存：会话被删除/目录消失 → 对应缓存条目随之失效；
+      - 单个会话扫描/解析失败静默跳过；无任务返回 []。
+    """
+    if now is None:
+        now = time.time()
+    plugin_tasks = read_progress_json(now)
+    if plugin_tasks:
+        return plugin_tasks  # 插件数据优先（已过滤噪音、实时）
     tasks = []
     files = scan_session_files()
     for path, mt in files:
