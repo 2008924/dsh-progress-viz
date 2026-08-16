@@ -1,6 +1,6 @@
 # dsh Progress Viz
 
-[![CI](https://github.com/2008924/dsh-progress-viz/actions/workflows/ci.yml/badge.svg)](https://github.com/2008924/dsh-progress-viz/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/2008924/dsh-progress-viz/actions/workflows/ci.yml/badge.svg)](https://github.com/2008924/dsh-progress-viz/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/) [![DSH Market 收录徽章](https://raw.githubusercontent.com/2BingLing/dsh-market/master/assets/readme/badge-listed-zh.svg)](https://dsh.market/)
 
 实时可视化 dsh（headless 模式）任务执行过程的独立看板工具包——读取会话事件流，呈现阶段进度、ETA 与实时动态流，纯本地运行。
 

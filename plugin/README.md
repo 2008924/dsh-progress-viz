@@ -1,5 +1,7 @@
 # dsh-progress-viz-plugin
 
+[![DSH Market 收录徽章](https://raw.githubusercontent.com/2BingLing/dsh-market/master/assets/readme/badge-listed-zh.svg)](https://dsh.market/)
+
 dsh 进度可视化插件：实时监听会话事件（`ctx.on('session/event')`），只保留
 「语义事件」推进进度状态，并原子重写 `<DSH_HOME>/progress/<session-id>.json`
 （及 `current.json`），供 [dsh-progress-viz 看板](../dashboard.py) 实时消费。
