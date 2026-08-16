@@ -39,12 +39,31 @@
   .tl-tool { color: #93c5fd; }   /* tool/call 动作高亮（蓝） */
   .tl-todo { color: #fbbf24; }   /* todo/write 进度高亮（黄） */
   .tl-type { color: #8b93a7; }   /* 时间线条目的事件类型（灰） */
+  /* 记录区块折叠：点击标题栏切换，默认展开（running 区块在上、completed 沉底） */
+  .sec-head { cursor: pointer; user-select: none; display: flex; align-items: center; gap: 8px; margin-top: 22px; font-size: 15px; color: #8b93a7; }
+  .sec-head:hover { color: #e6e6e6; }
+  .sec-head .caret-sec { font-size: 12px; display: inline-block; transition: transform .15s; }
+  .sec.collapsed .caret-sec { transform: rotate(-90deg); }
+  .sec.collapsed .sec-body { display: none; }
+  .sec-head .count-badge { background: #2a2d35; border-radius: 10px; padding: 2px 10px; font-size: 12px; }
 </style>
 </head>
 <body>
 <h1>📊 dsh Progress Viz <span class="muted" id="count">共 0 个任务 · 每 5 秒自动刷新</span></h1>
 
-<div class="grid" id="grid">查询中...</div>
+<div class="sec" id="sec-running">
+  <div class="sec-head" onclick="toggleSec('sec-running')">
+    <span class="caret-sec">▼</span>🟢 运行中 <span class="count-badge" id="run-count">0</span>
+  </div>
+  <div class="sec-body"><div class="grid" id="grid-running">查询中...</div></div>
+</div>
+
+<div class="sec" id="sec-done">
+  <div class="sec-head" onclick="toggleSec('sec-done')">
+    <span class="caret-sec">▼</span>✅ 已完成 <span class="count-badge" id="done-count">0</span>
+  </div>
+  <div class="sec-body"><div class="grid" id="grid-done"></div></div>
+</div>
 
 <script>
 function fmtDur(s) {
@@ -164,20 +183,32 @@ async function load() {
     const res = await fetch('/api/live');
     const live = await res.json();
     const tasks = live.tasks || [];
+    // running 置顶：运行中任务进上区块、已完成沉底进下区块
+    const running = tasks.filter(t => t.status === 'running');
+    const done = tasks.filter(t => t.status !== 'running');
     document.getElementById('count').textContent =
-      '共 ' + tasks.length + ' 个任务 · 每 5 秒自动刷新';
-    const grid = document.getElementById('grid');
+      '共 ' + tasks.length + ' 个任务 · 运行中 ' + running.length + ' · 每 5 秒自动刷新';
+    document.getElementById('run-count').textContent = running.length;
+    document.getElementById('done-count').textContent = done.length;
+    const gridR = document.getElementById('grid-running');
+    const gridD = document.getElementById('grid-done');
     if (!tasks.length) {
       // 空状态：无任务
-      grid.innerHTML = '<div class="card"><span class="status-dot dot-done"></span> 等待 dsh 任务开始...' +
+      gridR.innerHTML = '<div class="card"><span class="status-dot dot-done"></span> 等待 dsh 任务开始...' +
         '<div class="muted" style="margin-top:8px;">未在最近 1 小时内发现 ~/.dsh/sessions 下的会话，' +
         '启动一个 dsh headless 任务后，这里会自动显示多任务分栏（阶段 / ETA / 标题 / 成本估算 / 详情时间线）。</div></div>';
+      gridD.innerHTML = '';
       return;
     }
-    grid.innerHTML = tasks.map(cardHtml).join('');
+    gridR.innerHTML = running.map(cardHtml).join('') || '<div class="card"><span class="muted">暂无运行中任务</span></div>';
+    gridD.innerHTML = done.map(cardHtml).join('') || '<div class="card"><span class="muted">暂无已完成任务</span></div>';
   } catch (e) {
-    document.getElementById('grid').textContent = '看板 API 不可用: ' + e.message;
+    document.getElementById('grid-running').textContent = '看板 API 不可用: ' + e.message;
   }
+}
+// 区块折叠/展开：点击标题栏切换（默认展开）
+function toggleSec(id) {
+  document.getElementById(id).classList.toggle('collapsed');
 }
 load();
 setInterval(load, 5000);
