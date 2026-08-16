@@ -19,6 +19,11 @@
     "README.md"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2008924/dsh-progress-viz.git"
+  },
+  "homepage": "https://github.com/2008924/dsh-progress-viz",
   "keywords": [
     "deepseek",
     "dsh",
