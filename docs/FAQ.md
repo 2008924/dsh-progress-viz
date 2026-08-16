@@ -12,7 +12,7 @@
 pip install "zstandard>=0.21"
 
 # 方式二：按项目安装（pyproject.toml 已声明该依赖，会自动带上）
-pip install -e .
+pip install .
 ```
 
 安装完成后重新运行 `python dashboard.py` 即可。
@@ -81,6 +81,6 @@ Windows 路径（例如任务在兼容层/远程环境下产生），属于数�
 ## 7. 如何停止/卸载看板？
 
 - **停止**：在运行看板的终端按 `Ctrl+C` 即可退出（看板是前台进程，无后台驻留）。
-- **卸载**：如果之前执行过 `pip install -e .`，先 `pip uninstall dsh-progress-viz`；
+- **卸载**：如果之前执行过 `pip install .`，先 `pip uninstall dsh-progress-viz`；
   然后删除项目源码目录即可。看板不写注册表、不设开机自启、不产生全局状态，
   删除目录后即完全清除。

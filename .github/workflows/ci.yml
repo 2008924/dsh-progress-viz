@@ -38,3 +38,11 @@ jobs:
         run: python tests/test_multi_pane.py
       - name: 单测 test_tail_format
         run: python tests/test_tail_format.py
+      - name: 单测 test_port
+        run: python tests/test_port.py
+      - name: 单测 test_cache
+        run: python tests/test_cache.py
+      - name: 单测 test_v11
+        run: python tests/test_v11.py
+      - name: 单测 test_plugin_progress
+        run: python tests/test_plugin_progress.py

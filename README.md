@@ -82,7 +82,7 @@ python dashboard.py 8123        # 或 python -m dashboard 8123
   事件流（默认展开，max-height 滚动）；
 - **已完成卡片**（mtime 距今 > 30s）：灰色「已完成」+ 标题 + cwd + 耗时 + 最后阶段名
   （stage 或「步骤N」），事件流**默认折叠**（点击展开），避免信息过载；
-- **无任务时**：显示"等待 dsh 任务开始..."，启动一个 dsh headless 任务后自动出现分栏；
+- **无任务时**：显示「等待 dsh 任务开始...」，启动一个 dsh headless 任务后自动出现分栏；
 - 标题区实时显示任务总数（如「共 3 个任务 · 每 5 秒自动刷新」）。
 
 `/api/live` 返回最近任务列表 JSON：`{"tasks": [ {id, cwd, title, status, stage,
@@ -185,13 +185,14 @@ rename，每次语义事件更新重写）；会话结束（`session/disposed` �
 
 ```bash
 python tests/make_fixtures.py          # 生成合成 fixtures（无真实会话数据）
-python tests/test_session_progress.py  # 跑全部单测（无需 pytest），exit 0 全过
+python tests/test_session_progress.py  # 会话解析单测（无需 pytest），exit 0 全过
 python tests/test_eta_blend.py         # ETA 融合算法单测（历史会话 fixture 生成到临时目录）
 python tests/test_multi_pane.py        # 多任务分栏单测（1 小时窗口 / mtime 排序 / status 判定）
 python tests/test_tail_format.py       # tail 可读性单测（chunk 合并 / 时间戳 / 动作高亮 / 截断）
 python tests/test_port.py              # 端口冲突自动递增单测（socket 占用模拟，随机高位端口）
 python tests/test_cache.py             # 解析缓存单测（mtime 未变不重新解压 / 修改后重解析 / 缓存清理）
 python tests/test_v11.py               # v1.1 五项增强单测（标题 / 成本 / CLI --status / 飞书通知 / 时间线）
+python tests/test_plugin_progress.py   # 插件版数据源单测（优先级 / 回退 / status / 去重 / 窗口）
 ```
 
 GitHub Actions CI（`.github/workflows/ci.yml`）在 push 到 main 与 pull_request 时，
@@ -222,6 +223,7 @@ dsh-progress-viz/
 │   ├── test_port.py                  # 端口冲突自动递增单测
 │   ├── test_cache.py                 # 解析缓存单测
 │   ├── test_v11.py                   # v1.1 五项增强单测（标题/成本/CLI/飞书/时间线）
+│   ├── test_plugin_progress.py       # 插件版数据源单测（优先级/回退/status/去重/窗口）
 │   └── fixtures/session-synthetic.jsonl.zstd
 ├── docs/
 │   ├── FAQ.md            # 常见问题（7 问 7 答）

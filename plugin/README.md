@@ -11,7 +11,8 @@ dsh 进度可视化插件：实时监听会话事件（`ctx.on('session/event')`
 插件作为 cordis 插件挂载到目标 profile（任务执行的地方，如 headless）：
 
 ```bash
-# 在 dsh-project 根目录执行（registry 用国内 npmmirror）
+# 在 plugin/ 目录执行（registry 用国内 npmmirror）
+cd publish/dsh-progress-viz/plugin
 pnpm install --registry https://registry.npmmirror.com
 pnpm build
 dsh plugin --profile headless add <本插件目录绝对路径>
@@ -76,6 +77,7 @@ tool-call-chunks、text-chunks、request/* 等）已被过滤，不进入时间�
 ## 构建
 
 ```bash
+cd publish/dsh-progress-viz/plugin   # 已在该目录则跳过
 pnpm install --registry https://registry.npmmirror.com
 pnpm build   # tsc → lib/index.js
 ```

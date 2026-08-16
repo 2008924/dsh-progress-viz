@@ -43,14 +43,17 @@ def check(name, cond, detail=""):
 
 
 def with_root(fn):
-    """把 sp.SESSIONS_ROOT 临时指向新目录执行 fn(root)，结束后恢复并清理。"""
+    """把 sp.SESSIONS_ROOT / db.PROGRESS_ROOT 临时指向新目录执行 fn(root)，结束后恢复并清理。"""
     root = tempfile.mkdtemp(prefix="dsh-v11-test-")
     old = sp.SESSIONS_ROOT
+    old_prog = db.PROGRESS_ROOT
     sp.SESSIONS_ROOT = root
+    db.PROGRESS_ROOT = os.path.join(root, "progress")  # 不存在 → scan_tasks 回退 zstd 解析
     try:
         return fn(root)
     finally:
         sp.SESSIONS_ROOT = old
+        db.PROGRESS_ROOT = old_prog
         shutil.rmtree(root, ignore_errors=True)
 
 
