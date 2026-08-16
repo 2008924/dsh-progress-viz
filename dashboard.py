@@ -229,7 +229,8 @@ def _task_title(events, cwd):
     if title:
         return title
     if cwd:
-        base = os.path.basename(cwd.rstrip("\\/"))
+        # 跨平台：Windows 风格 cwd（反斜杠）在 POSIX 上 basename 不认 → 先统一正斜杠
+        base = os.path.basename(cwd.rstrip("\\/").replace("\\", "/"))
         return base or cwd
     return None
 
